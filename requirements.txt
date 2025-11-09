@@ -1,0 +1,32 @@
+# Core chemistry
+rdkit>=2023.9.1
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# ChEMBL data access
+chembl-webresource-client>=0.10.8  # API access (slow but flexible)
+chembl-downloader>=0.4.0  # Bulk download (FAST - recommended for large datasets)
+
+# Deep learning (optional, for ChemBERTa and neural network models)
+# Install with: pip install torch transformers
+# For CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+transformers>=4.30.0
+
+# Utilities
+tqdm>=4.65.0
+requests>=2.31.0
+psutil>=5.9.0  # Memory monitoring
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Jupyter notebooks
+jupyter>=1.0.0
+ipykernel>=6.25.0
