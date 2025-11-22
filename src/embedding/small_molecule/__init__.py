@@ -5,11 +5,14 @@ Small molecule embedding methods.
 from .base import MoleculeEmbedder
 from .fingerprints import FingerprintEmbedder
 from .edit_embedder import EditEmbedder
+from .trainable_edit_embedder import TrainableEditEmbedder, ConcatenationEditEmbedder
 
 __all__ = [
     'MoleculeEmbedder',
     'FingerprintEmbedder',
-    'EditEmbedder'
+    'EditEmbedder',
+    'TrainableEditEmbedder',
+    'ConcatenationEditEmbedder',
 ]
 
 # Optional imports (require additional dependencies)

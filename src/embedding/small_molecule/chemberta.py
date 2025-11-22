@@ -56,8 +56,12 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
 
         # Load model and tokenizer
         print(f"Loading {model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name).to(self.device)
         self.model.eval()  # Set to evaluation mode
 
         # Cache embedding dimension
@@ -77,14 +81,23 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
             smiles = [smiles]
             return_single = True
         else:
+            # Convert numpy array to list if needed
+            if isinstance(smiles, np.ndarray):
+                smiles = smiles.tolist()
             return_single = False
 
-        # Batch encode
+        # Batch encode with progress bar
+        from tqdm.auto import tqdm
+
         all_embeddings = []
-        for i in range(0, len(smiles), self.batch_size):
-            batch = smiles[i:i + self.batch_size]
-            batch_emb = self._encode_batch(batch)
-            all_embeddings.append(batch_emb)
+        n_batches = (len(smiles) + self.batch_size - 1) // self.batch_size
+
+        with tqdm(total=len(smiles), desc="Encoding molecules", unit="mol") as pbar:
+            for i in range(0, len(smiles), self.batch_size):
+                batch = smiles[i:i + self.batch_size]
+                batch_emb = self._encode_batch(batch)
+                all_embeddings.append(batch_emb)
+                pbar.update(len(batch))
 
         embeddings = np.vstack(all_embeddings)
 

@@ -381,19 +381,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Download ChEMBL with per-target bioactivity columns",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Download 100K molecules with top 50 targets
-  python download_chembl_per_target.py --target 100000 --top-targets 50
-
-  # Download with more targets and specific activity types
-  python download_chembl_per_target.py --target 50000 --top-targets 100 --activity-types IC50 Ki
-
-  # Require molecules tested against at least 3 targets
-  python download_chembl_per_target.py --target 100000 --min-targets 3
-        """
+        description="Download ChEMBL with per-target bioactivity columns"
     )
 
     parser.add_argument('--target', type=int, default=100000,

@@ -253,3 +253,46 @@ def is_valid_molecule(smiles: str,
 
     except Exception:
         return False
+
+
+def parse_edit_smiles(edit_smiles: str) -> Tuple[str, str]:
+    """
+    Parse edit SMILES format into fragment A and fragment B.
+
+    Args:
+        edit_smiles: Reaction SMILES in format "fragment_a>>fragment_b"
+
+    Returns:
+        Tuple of (fragment_a_smiles, fragment_b_smiles)
+
+    Raises:
+        ValueError: If edit_smiles format is invalid
+
+    """
+    if '>>' not in edit_smiles:
+        raise ValueError(f"Invalid edit SMILES format (missing '>>'): {edit_smiles}")
+
+    parts = edit_smiles.split('>>')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid edit SMILES format (expected 2 parts): {edit_smiles}")
+
+    frag_a, frag_b = parts[0].strip(), parts[1].strip()
+
+    if not frag_a or not frag_b:
+        raise ValueError(f"Empty fragment in edit SMILES: {edit_smiles}")
+
+    return frag_a, frag_b
+
+
+def get_edit_name(mol_a_smiles: str, mol_b_smiles: str) -> str:
+    """
+    Generate a canonical name for a molecular edit.
+
+    Args:
+        mol_a_smiles: Molecule A SMILES
+        mol_b_smiles: Molecule B SMILES
+
+    Returns:
+        Edit name in format "mol_a>>mol_b"
+    """
+    return f"{mol_a_smiles}>>{mol_b_smiles}"

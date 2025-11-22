@@ -14,9 +14,20 @@ from .base import MoleculeEmbedder
 
 class EditEmbedder:
     """
-    Edit embedder using difference of molecule embeddings.
+    Edit embedder using difference of molecule embeddings with two modes.
 
-    Computes: edit = product - reactant
+    **Two Modes:**
+
+    Mode 1 (use_edit_fragments=False): Full Molecule Embeddings
+        edit = Embed(full_mol_b) - Embed(full_mol_a)
+        - Context-aware: Different scaffolds produce different edit vectors
+        - Works with SMILES pairs (mol_a, mol_b)
+
+    Mode 2 (use_edit_fragments=True): Edit Fragment Embeddings
+        edit = Embed(edit_fragment_product) - Embed(edit_fragment_reactant)
+        - Scaffold-independent: Same transformation always same vector
+        - Works with edit_smiles format "fragment_a>>fragment_b"
+        - Better transfer learning
 
     This approach:
     - Works with ANY molecule embedder (fingerprints, transformers, GNNs)
@@ -27,40 +38,37 @@ class EditEmbedder:
     Args:
         molecule_embedder: Any MoleculeEmbedder instance
                           (FingerprintEmbedder, ChemBERTaEmbedder, etc.)
+        use_edit_fragments: If True, use edit_smiles fragments (Mode 2)
+                           If False, use full molecules (Mode 1, default)
 
-    Example:
+    Example (Mode 1 - Full molecules):
         >>> from src.embedding import FingerprintEmbedder, EditEmbedder
-        >>>
-        >>> # Option 1: Morgan fingerprints
         >>> mol_emb = FingerprintEmbedder(fp_type='morgan', radius=2, n_bits=2048)
-        >>> edit_emb = EditEmbedder(mol_emb)
-        >>>
-        >>> # Compute edit embedding from SMILES pair
-        >>> edit_vec = edit_emb.encode_from_smiles('CCO', 'CC(=O)O')  # ethanol -> acetic acid
-        >>> print(edit_vec.shape)  # (2048,)
-        >>>
-        >>> # Option 2: ChemBERTa
-        >>> from src.embedding import ChemBERTaEmbedder
-        >>> mol_emb = ChemBERTaEmbedder(model_name='chemberta')
-        >>> edit_emb = EditEmbedder(mol_emb)
+        >>> edit_emb = EditEmbedder(mol_emb, use_edit_fragments=False)
         >>> edit_vec = edit_emb.encode_from_smiles('CCO', 'CC(=O)O')
-        >>> print(edit_vec.shape)  # (768,) - ChemBERTa hidden size
+        >>> print(edit_vec.shape)  # (2048,)
+
+    Example (Mode 2 - Edit fragments):
+        >>> edit_emb = EditEmbedder(mol_emb, use_edit_fragments=True)
+        >>> edit_vec = edit_emb.encode_from_edit_smiles('[*]O>>[*]C(=O)O')
+        >>> print(edit_vec.shape)  # (2048,)
     """
 
-    def __init__(self, molecule_embedder: MoleculeEmbedder):
+    def __init__(self, molecule_embedder: MoleculeEmbedder, use_edit_fragments: bool = False):
         self.molecule_embedder = molecule_embedder
+        self.use_edit_fragments = use_edit_fragments
 
     def encode_from_smiles(
         self,
-        reactant: Union[str, List[str]],
-        product: Union[str, List[str]]
+        mol_a: Union[str, List[str]],
+        mol_b: Union[str, List[str]]
     ) -> np.ndarray:
         """
-        Encode edit(s) from reactant and product SMILES.
+        Encode edit(s) from molecule A and molecule B SMILES.
 
         Args:
-            reactant: Reactant SMILES (single or list)
-            product: Product SMILES (single or list)
+            mol_a: Molecule A SMILES (single or list)
+            mol_b: Molecule B SMILES (single or list)
 
         Returns:
             Edit embedding(s) as numpy array
@@ -68,23 +76,23 @@ class EditEmbedder:
             - Multiple pairs: shape (n_edits, embedding_dim)
         """
         # Handle single vs batch
-        if isinstance(reactant, str):
-            assert isinstance(product, str), "Reactant and product must both be strings or lists"
-            reactants = [reactant]
-            products = [product]
+        if isinstance(mol_a, str):
+            assert isinstance(mol_b, str), "mol_a and mol_b must both be strings or lists"
+            mol_a_list = [mol_a]
+            mol_b_list = [mol_b]
             return_single = True
         else:
-            assert len(reactant) == len(product), "Reactant and product lists must have same length"
-            reactants = reactant
-            products = product
+            assert len(mol_a) == len(mol_b), "mol_a and mol_b lists must have same length"
+            mol_a_list = mol_a
+            mol_b_list = mol_b
             return_single = False
 
         # Encode molecules
-        reactant_emb = self.molecule_embedder.encode(reactants)
-        product_emb = self.molecule_embedder.encode(products)
+        mol_a_emb = self.molecule_embedder.encode(mol_a_list)
+        mol_b_emb = self.molecule_embedder.encode(mol_b_list)
 
         # Compute difference
-        edit_emb = product_emb - reactant_emb
+        edit_emb = mol_b_emb - mol_a_emb
 
         if return_single:
             return edit_emb[0]
@@ -99,14 +107,11 @@ class EditEmbedder:
         Encode edit(s) from reaction SMILES format.
 
         Args:
-            edit_smiles: Reaction SMILES "reactant>>product" (single or list)
+            edit_smiles: Reaction SMILES "mol_a>>mol_b" (single or list)
 
         Returns:
             Edit embedding(s) as numpy array
 
-        Example:
-            >>> edit_emb.encode_from_edit_smiles("CCO>>CC(=O)O")
-            >>> edit_emb.encode_from_edit_smiles(["C>>CC", "F>>Cl"])
         """
         if isinstance(edit_smiles, str):
             edit_smiles = [edit_smiles]
@@ -115,18 +120,18 @@ class EditEmbedder:
             return_single = False
 
         # Parse reaction SMILES
-        reactants = []
-        products = []
+        mol_a_list = []
+        mol_b_list = []
         for edit in edit_smiles:
             if '>>' not in edit:
                 raise ValueError(f"Invalid edit SMILES (missing '>>'): {edit}")
 
-            react, prod = edit.split('>>')
-            reactants.append(react)
-            products.append(prod)
+            mol_a_str, mol_b_str = edit.split('>>')
+            mol_a_list.append(mol_a_str)
+            mol_b_list.append(mol_b_str)
 
         # Encode
-        edit_emb = self.encode_from_smiles(reactants, products)
+        edit_emb = self.encode_from_smiles(mol_a_list, mol_b_list)
 
         if return_single:
             return edit_emb[0] if edit_emb.ndim > 1 else edit_emb
@@ -143,13 +148,6 @@ class EditEmbedder:
         Returns:
             Edit embeddings array of shape (n_pairs, embedding_dim)
 
-        Example:
-            >>> import pandas as pd
-            >>> pairs = pd.DataFrame({
-            ...     'mol_a': ['CCO', 'c1ccccc1'],
-            ...     'mol_b': ['CC(=O)O', 'c1ccncc1']
-            ... })
-            >>> edit_embeddings = edit_emb.encode_from_pair_df(pairs)
         """
         return self.encode_from_smiles(
             pairs_df['mol_a'].tolist(),
@@ -181,9 +179,6 @@ def edit_embedder_morgan(radius: int = 2, n_bits: int = 2048) -> EditEmbedder:
     Returns:
         EditEmbedder instance
 
-    Example:
-        >>> edit_emb = edit_embedder_morgan(radius=2, n_bits=2048)
-        >>> edit_vec = edit_emb.encode_from_edit_smiles("C>>CC")  # methylation
     """
     from .fingerprints import FingerprintEmbedder
     mol_emb = FingerprintEmbedder(fp_type='morgan', radius=radius, n_bits=n_bits)
@@ -201,9 +196,6 @@ def edit_embedder_chemberta(model_name: str = 'chemberta', pooling: str = 'mean'
     Returns:
         EditEmbedder instance
 
-    Example:
-        >>> edit_emb = edit_embedder_chemberta()
-        >>> edit_vec = edit_emb.encode_from_edit_smiles("C>>CC")
     """
     try:
         from .chemberta import ChemBERTaEmbedder

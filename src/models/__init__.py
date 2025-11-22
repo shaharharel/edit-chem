@@ -1,36 +1,41 @@
 """
-Predictive models for molecular property optimization.
+Machine learning models for molecular property prediction.
 """
 
-# Property prediction (baseline non-causal)
-from .property_predictor import PropertyPredictor, PropertyPredictorMLP
-
-# Edit effect prediction (causal)
-from .edit_effect_predictor import EditEffectPredictor, EditEffectMLP
-
-# Causal estimators (IPW, DR)
-from .causal_estimators import (
-    IPWEstimator,
-    DoublyRobustEstimator,
-    PropensityScoreModel
+# Predictors (each with their own PyTorch Lightning modules)
+from .predictors import (
+    PropertyPredictor,
+    PropertyPredictorMLP,
+    EditEffectPredictor,
+    EditEffectMLP,
 )
 
-# Legacy models
-from .delta_predictor import DeltaPropertyPredictor, DeltaPropertyMLP
+# Multi-task architectures
+from .architectures import (
+    SharedBackbone,
+    TaskHead,
+    MultiTaskHead,
+)
+
+# Training utilities
+from .dataset import EditDataset, create_dataloaders, create_datasets_from_embeddings
+from .trainer import Trainer
 
 __all__ = [
-    # New PyTorch Lightning models
+    # Predictors
     'PropertyPredictor',
     'PropertyPredictorMLP',
     'EditEffectPredictor',
     'EditEffectMLP',
 
-    # Causal estimators
-    'IPWEstimator',
-    'DoublyRobustEstimator',
-    'PropensityScoreModel',
+    # Multi-task architectures
+    'SharedBackbone',
+    'TaskHead',
+    'MultiTaskHead',
 
-    # Legacy models
-    'DeltaPropertyPredictor',
-    'DeltaPropertyMLP',
+    # Training
+    'EditDataset',
+    'create_dataloaders',
+    'create_datasets_from_embeddings',
+    'Trainer',
 ]

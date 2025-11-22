@@ -13,9 +13,10 @@ chembl-webresource-client>=0.10.8  # API access (slow but flexible)
 chembl-downloader>=0.4.0  # Bulk download (FAST - recommended for large datasets)
 
 # Deep learning (optional, for ChemBERTa and neural network models)
-# Install with: pip install torch transformers
+# Install with: pip install torch transformers pytorch-lightning
 # For CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
+pytorch-lightning>=2.0.0
 transformers>=4.30.0
 
 # Utilities
