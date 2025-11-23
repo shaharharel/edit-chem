@@ -41,7 +41,8 @@ class ChemPropEmbedder(MoleculeEmbedder):
         featurizer_type: str = 'morgan',
         morgan_radius: int = 2,
         morgan_length: int = 2048,  # ChemProp default
-        include_chirality: bool = True
+        include_chirality: bool = True,
+        device: str = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
     ):
         self.model_path = model_path
         self.batch_size = batch_size
@@ -49,6 +50,7 @@ class ChemPropEmbedder(MoleculeEmbedder):
         self.morgan_radius = morgan_radius
         self.morgan_length = morgan_length
         self.include_chirality = include_chirality
+        self.device = device
 
         # Try to import ChemProp v2
         try:
@@ -109,8 +111,9 @@ class ChemPropEmbedder(MoleculeEmbedder):
         elif self.featurizer_type == 'graph':
             from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer
             from chemprop.nn import BondMessagePassing, MeanAggregation
+            import torch
 
-            print("Using ChemProp v2 D-MPNN graph embeddings (300-dim)")
+            print(f"Using ChemProp v2 D-MPNN graph embeddings (300-dim) on {self.device}")
 
             # Create graph featurizer
             self.featurizer = SimpleMoleculeMolGraphFeaturizer()
@@ -125,6 +128,10 @@ class ChemPropEmbedder(MoleculeEmbedder):
                 dropout=0.0
             )
             self.aggregation = MeanAggregation()
+
+            # Move to GPU if available
+            self.message_passing = self.message_passing.to(self.device)
+            self.aggregation = self.aggregation.to(self.device)
 
             # Set to eval mode (frozen - no training)
             self.message_passing.eval()
@@ -267,8 +274,8 @@ class ChemPropEmbedder(MoleculeEmbedder):
                     ])
                     continue
 
-                # Batch graphs
-                batch_graph = BatchMolGraph(valid_graphs)
+                # Batch graphs and move to device
+                batch_graph = BatchMolGraph(valid_graphs).to(self.device)
 
                 # Forward through message passing
                 h = self.message_passing(batch_graph)
