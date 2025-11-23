@@ -275,7 +275,18 @@ class ChemPropEmbedder(MoleculeEmbedder):
                     continue
 
                 # Batch graphs and move to device
-                batch_graph = BatchMolGraph(valid_graphs).to(self.device)
+                try:
+                    batch_graph = BatchMolGraph(valid_graphs)
+                    # Use official ChemProp v2 .to() method to move graph to device
+                    batch_graph = batch_graph.to(self.device)
+                except Exception as e:
+                    print(f"Error creating BatchMolGraph: {e}")
+                    # If batching fails, use zeros for all
+                    embeddings.extend([
+                        np.zeros(self._embedding_dim, dtype=np.float32)
+                        for _ in batch_graphs
+                    ])
+                    continue
 
                 # Forward through message passing
                 h = self.message_passing(batch_graph)
