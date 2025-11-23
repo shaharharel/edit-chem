@@ -454,7 +454,8 @@ class PropertyPredictor:
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0
+            num_workers=4,
+            pin_memory=True
         )
 
         # Validation data
@@ -490,7 +491,8 @@ class PropertyPredictor:
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=self.batch_size,
-                num_workers=0
+                num_workers=4,
+                pin_memory=True
             )
 
         # Initialize model
