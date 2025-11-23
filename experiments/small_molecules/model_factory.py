@@ -11,7 +11,17 @@ def create_embedder(embedder_type: str):
     if embedder_type == 'chemberta':
         return ChemBERTaEmbedder()
     elif embedder_type == 'chemprop':
+        # Default: Morgan fingerprints (CPU-based, 2048-dim)
         return ChemPropEmbedder()
+    elif embedder_type == 'chemprop_dmpnn':
+        # D-MPNN graph neural network (GPU-capable, 300-dim)
+        return ChemPropEmbedder(featurizer_type='graph')
+    elif embedder_type == 'chemprop_morgan':
+        # Explicit Morgan fingerprints (same as 'chemprop' default)
+        return ChemPropEmbedder(featurizer_type='morgan')
+    elif embedder_type == 'chemprop_rdkit':
+        # RDKit 2D descriptors (CPU-based, 217-dim)
+        return ChemPropEmbedder(featurizer_type='rdkit2d')
     else:
         raise ValueError(f"Unknown embedder type: {embedder_type}")
 

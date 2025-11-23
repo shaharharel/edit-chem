@@ -69,7 +69,7 @@ def main():
                 }
             ],
 
-            embedder_type='chemprop',
+            embedder_type='chemprop_dmpnn',
 
             metrics=['mae', 'rmse', 'r2', 'pearson_r', 'spearman_r'],
 
