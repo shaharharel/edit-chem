@@ -246,13 +246,13 @@ class IPWEstimator:
             torch.FloatTensor(mol_train),
             torch.LongTensor(edit_train)
         )
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
         val_dataset = TensorDataset(
             torch.FloatTensor(mol_val),
             torch.LongTensor(edit_val)
         )
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, num_workers=4, pin_memory=True)
 
         # Initialize model
         self.propensity_model = PropensityScoreModel(
@@ -503,7 +503,7 @@ class DoublyRobustEstimator:
             torch.FloatTensor(edit_emb),
             torch.FloatTensor(delta_y)
         )
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
         # Initialize model
         model = EditEffectMLP(
@@ -536,7 +536,7 @@ class DoublyRobustEstimator:
             torch.FloatTensor(mol_emb),
             torch.LongTensor(edit_idx)
         )
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
         # Initialize model
         model = PropensityScoreModel(

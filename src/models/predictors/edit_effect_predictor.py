@@ -12,6 +12,9 @@ from typing import Optional, List, Union, Tuple
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
+# Enable Tensor Cores for L4 GPU
+torch.set_float32_matmul_precision('high')
+
 
 class EditEffectMLP(pl.LightningModule):
     """
@@ -608,7 +611,8 @@ class EditEffectPredictor:
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0
+            num_workers=4,
+            pin_memory=True  # Faster CPU→GPU transfer
         )
 
         # Validation data
@@ -681,7 +685,8 @@ class EditEffectPredictor:
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=self.batch_size,
-                num_workers=0
+                num_workers=4,
+                pin_memory=True
             )
 
         # Initialize model
