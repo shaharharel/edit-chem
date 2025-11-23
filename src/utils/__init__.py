@@ -1,6 +1,10 @@
-"""Utility modules."""
+"""
+Modality-agnostic utility modules.
 
-from .chemistry import standardize_smiles, smiles_to_mol, mol_to_smiles, parse_edit_smiles, get_edit_name
+These utilities work with any data type and don't contain domain-specific logic.
+For modality-specific utilities (e.g., chemistry for small molecules), see src/data/<modality>/utils/
+"""
+
 from .logging import setup_logger
 from .embedding_cache import (
     EmbeddingCache,
@@ -31,11 +35,6 @@ from .metrics import (
 )
 
 __all__ = [
-    'standardize_smiles',
-    'smiles_to_mol',
-    'mol_to_smiles',
-    'parse_edit_smiles',
-    'get_edit_name',
     'setup_logger',
     'EmbeddingCache',
     'get_or_compute_embeddings_for_pairs',

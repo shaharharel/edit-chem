@@ -31,8 +31,8 @@ def perform_cluster_analysis(
     with torch.no_grad():
         all_edit_emb = edit_layer(reactant_tensor, product_tensor).cpu().numpy()
 
-    unique_edits = test_df['edit_name'].unique()
-    edit_to_idx = {edit: test_df[test_df['edit_name'] == edit].index[0]
+    unique_edits = test_df['edit_smiles'].unique()
+    edit_to_idx = {edit: test_df[test_df['edit_smiles'] == edit].index[0]
                    for edit in unique_edits}
 
     edit_embeddings = np.array([all_edit_emb[idx] for idx in edit_to_idx.values()])
@@ -46,7 +46,7 @@ def perform_cluster_analysis(
 
     cluster_centers = kmeans.cluster_centers_
 
-    overall_edit_counts = Counter(test_df['edit_name'])
+    overall_edit_counts = Counter(test_df['edit_smiles'])
 
     cluster_edits = defaultdict(list)
     for idx, (edit_name, cluster_id) in enumerate(zip(edit_names, cluster_labels)):

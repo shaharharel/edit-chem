@@ -63,10 +63,16 @@ def prepare_embeddings(
             }
 
             if use_fragments:
-                frag_a_emb, frag_b_emb = map_fragment_embeddings_to_pairs(
-                    df, emb_lookup, f"{prop}_{split_name}"
-                )
-                embeddings[prop][split_name]['edit_frag_a'] = frag_a_emb
-                embeddings[prop][split_name]['edit_frag_b'] = frag_b_emb
+                try:
+                    frag_a_emb, frag_b_emb = map_fragment_embeddings_to_pairs(
+                        df, emb_lookup, f"{prop}_{split_name}"
+                    )
+                    embeddings[prop][split_name]['edit_frag_a'] = frag_a_emb
+                    embeddings[prop][split_name]['edit_frag_b'] = frag_b_emb
+                except Exception as e:
+                    # Handle cases where fragment mapping fails (e.g., no edit_smiles)
+                    print(f"  Warning: Could not map fragments for {prop}_{split_name}: {e}")
+                    embeddings[prop][split_name]['edit_frag_a'] = np.array([])
+                    embeddings[prop][split_name]['edit_frag_b'] = np.array([])
 
     return embeddings

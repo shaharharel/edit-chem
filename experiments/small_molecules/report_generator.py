@@ -11,7 +11,7 @@ from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from typing import Dict
 from datetime import datetime
-from scripts.plot_training_progress import plot_training_progress_per_epoch
+from scripts.visualization.plot_training_progress import plot_training_progress_per_epoch
 from cluster_analysis import perform_cluster_analysis
 from edit_embedding_comparison import compare_edit_embeddings
 
@@ -105,22 +105,63 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_name = f"{config.experiment_name}_{timestamp}"
 
+    # Create separate directories for reports and images
+    reports_dir = output_dir / "reports"
+    images_dir = output_dir / "images" / timestamp
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
     doc = Document()
 
     title = doc.add_heading(f'Experiment Report: {config.experiment_name}', 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_heading('Experiment Configuration', 1)
+
+    # General Configuration
+    doc.add_heading('General Settings', 2)
+    doc.add_paragraph(f"Experiment Name: {config.experiment_name}")
     doc.add_paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     doc.add_paragraph(f"Data File: {config.data_file}")
-    doc.add_paragraph(f"Splitter: {config.splitter_type}")
-    doc.add_paragraph(f"Train/Val/Test Ratio: {config.train_ratio}/{config.val_ratio}/{config.test_ratio}")
     doc.add_paragraph(f"Random Seed: {config.random_seed}")
-    doc.add_paragraph(f"Number of Tasks: {config.num_tasks}")
 
-    doc.add_heading('Methods', 2)
-    for method in config.methods:
-        doc.add_paragraph(f"• {method['name']} ({method['type']})", style='List Bullet')
+    # Data Configuration
+    doc.add_heading('Data Configuration', 2)
+    doc.add_paragraph(f"Number of Tasks: {config.num_tasks}")
+    doc.add_paragraph(f"Minimum Pairs per Property: {config.min_pairs_per_property}")
+    doc.add_paragraph(f"Splitter Type: {config.splitter_type}")
+    doc.add_paragraph(f"Train/Val/Test Ratio: {config.train_ratio}/{config.val_ratio}/{config.test_ratio}")
+    if config.splitter_params and config.splitter_type in config.splitter_params:
+        params = config.splitter_params[config.splitter_type]
+        doc.add_paragraph(f"Splitter Parameters: {params}")
+
+    # Embedding Configuration
+    doc.add_heading('Embedding Configuration', 2)
+    doc.add_paragraph(f"Embedder Type: {config.embedder_type}")
+
+    # Methods Configuration
+    doc.add_heading('Methods Configuration', 2)
+    for i, method in enumerate(config.methods, 1):
+        doc.add_paragraph(f"{i}. {method['name']}", style='List Bullet')
+        doc.add_paragraph(f"   Type: {method['type']}")
+        doc.add_paragraph(f"   Hidden Dimensions: {method.get('hidden_dims', 'N/A')}")
+        doc.add_paragraph(f"   Dropout: {method.get('dropout', 'N/A')}")
+        doc.add_paragraph(f"   Learning Rate: {method.get('lr', 'N/A')}")
+        doc.add_paragraph(f"   Batch Size: {method.get('batch_size', 'N/A')}")
+        doc.add_paragraph(f"   Max Epochs: {method.get('max_epochs', 'N/A')}")
+        if method['type'] == 'edit_framework':
+            doc.add_paragraph(f"   Use Edit Fragments: {method.get('use_edit_fragments', False)}")
+        if 'load_checkpoint' in method and method['load_checkpoint']:
+            doc.add_paragraph(f"   Loaded from Checkpoint: {method['load_checkpoint']}")
+
+    # Analysis Configuration
+    doc.add_heading('Analysis Configuration', 2)
+    doc.add_paragraph(f"Metrics: {', '.join(config.metrics)}")
+    doc.add_paragraph(f"Include Cluster Analysis: {config.include_cluster_analysis}")
+    if config.include_cluster_analysis:
+        doc.add_paragraph(f"Number of Clusters: {config.n_clusters}")
+    doc.add_paragraph(f"Include Edit Embedding Comparison: {config.include_edit_embedding_comparison}")
+    doc.add_paragraph(f"Save Models: {config.save_models}")
 
     if trained_models:
         doc.add_heading('Training Progress', 1)
@@ -141,7 +182,7 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
                 if fig is not None:
                     doc.add_heading(f'{method_name}', 2)
 
-                    plot_path = output_dir / f"{report_name}_training_{method_name}.png"
+                    plot_path = images_dir / f"training_{method_name}.png"
                     fig.savefig(str(plot_path), dpi=150, bbox_inches='tight')
                     plt.close(fig)
 
@@ -156,7 +197,7 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
     test_results = results['test']
 
     for metric in config.metrics:
-        plot_path = output_dir / f"{report_name}_test_{metric}_comparison.png"
+        plot_path = images_dir / f"test_{metric}_comparison.png"
         create_comparison_plot(test_results, metric, str(plot_path))
 
         doc.add_heading(f'{metric.upper()} Comparison', 2)
@@ -210,7 +251,7 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
             y_true = prop_results['y_true']
             y_pred = prop_results['y_pred']
 
-            plot_path = output_dir / f"{report_name}_scatter_{method_name}_{prop}.png"
+            plot_path = images_dir / f"scatter_{method_name}_{prop}.png"
             create_scatter_plot(
                 y_true, y_pred,
                 f"{method_name} - {prop}",
@@ -288,7 +329,7 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
 
                     doc.add_heading(f'{method_name} - K-Means Clustering', 2)
 
-                    plot_path = output_dir / f"{report_name}_cluster_{method_name}.png"
+                    plot_path = images_dir / f"cluster_{method_name}.png"
                     fig.savefig(str(plot_path), dpi=150, bbox_inches='tight')
                     plt.close(fig)
 
@@ -330,7 +371,7 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
 
                     plot_names = ['r2_comparison', 'r2_improvement', 'mae_improvement']
                     for i, fig in enumerate(figures):
-                        plot_path = output_dir / f"{report_name}_emb_comp_{method_name}_{plot_names[i]}.png"
+                        plot_path = images_dir / f"emb_comp_{method_name}_{plot_names[i]}.png"
                         fig.savefig(str(plot_path), dpi=150, bbox_inches='tight')
                         plt.close(fig)
 
@@ -343,12 +384,14 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
     doc.add_heading('Summary', 1)
     doc.add_paragraph(f"Experiment completed successfully on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     doc.add_paragraph(f"Results saved to: {output_dir}")
+    doc.add_paragraph(f"Images saved to: {images_dir}")
 
-    report_path = output_dir / f"{report_name}.docx"
+    report_path = reports_dir / f"{config.experiment_name}.docx"
     doc.save(str(report_path))
 
     print(f"\n{'='*80}")
     print(f"Report generated: {report_path}")
+    print(f"Images saved to: {images_dir}")
     print(f"{'='*80}")
 
     return str(report_path)

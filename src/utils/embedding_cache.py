@@ -472,7 +472,7 @@ def compute_all_embeddings_with_fragments(
     Returns:
         Dict mapping SMILES -> embedding (includes both full molecules and fragments)
     """
-    from .chemistry import parse_edit_smiles
+    from src.data.small_molecule.utils.chemistry import parse_edit_smiles
 
     print("Collecting all unique molecules...")
 
@@ -536,7 +536,7 @@ def map_fragment_embeddings_to_pairs(
         Tuple of (frag_a_emb, frag_b_emb)
 
     """
-    from .chemistry import parse_edit_smiles
+    from src.data.small_molecule.utils.chemistry import parse_edit_smiles
 
     print(f"{dataset_name}: Mapping {len(df)} edit fragments to embeddings")
 

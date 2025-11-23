@@ -4,31 +4,27 @@ from typing import List, Dict, Optional
 
 @dataclass
 class ExperimentConfig:
+    # Required parameters
     experiment_name: str
-
     data_file: str
-    min_pairs_per_property: int
     num_tasks: int
-
     train_ratio: float
     val_ratio: float
     test_ratio: float
     random_seed: int
-
     splitter_type: str
-    splitter_params: Dict
-
     methods: List[Dict]
     metrics: List[str]
-    test_datasets: List[str]
-
-    save_models: bool
-    models_dir: str
     output_dir: str
 
+    # Optional parameters with defaults
+    min_pairs_per_property: int = 0
+    splitter_params: Dict = field(default_factory=dict)
+    test_datasets: List[str] = field(default_factory=list)
+    save_models: bool = False
+    models_dir: str = "models"
     embedder_type: str = 'chemprop'
-
     include_cluster_analysis: bool = True
     n_clusters: int = 4
-
     include_edit_embedding_comparison: bool = True
+    additional_test_files: Dict[str, str] = field(default_factory=dict)

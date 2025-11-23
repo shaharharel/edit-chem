@@ -1,8 +1,12 @@
-"""Data collection and preprocessing modules."""
+"""
+Data processing modules organized by modality.
 
-from .chembl_collector import ChEMBLCollector
-from .osm_collector import OSMCollector
-from .covid_collector import COVIDMoonshotCollector
-from .preprocessor import DataPreprocessor
+Each modality subfolder contains:
+- Pair extraction logic (e.g., MMP for small molecules)
+- Edit vocabulary management
+- Modality-specific utilities
 
-__all__ = ['ChEMBLCollector', 'OSMCollector', 'COVIDMoonshotCollector', 'DataPreprocessor']
+Top-level data collection scripts (ChEMBL, OSM, COVID-19) remain here.
+"""
+
+__all__ = []

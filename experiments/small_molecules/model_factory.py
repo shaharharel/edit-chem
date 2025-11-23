@@ -32,7 +32,7 @@ def create_models(config, train_data: Dict, embedder) -> Dict:
                 dropout=method_config.get('dropout', 0.2),
                 learning_rate=method_config.get('lr', 0.001),
                 batch_size=method_config.get('batch_size', 32),
-                max_epochs=method_config.get('epochs', 50)
+                max_epochs=method_config.get('max_epochs', method_config.get('epochs', 50))
             )
 
             models[method_name] = {
@@ -53,7 +53,7 @@ def create_models(config, train_data: Dict, embedder) -> Dict:
                 dropout=method_config.get('dropout', 0.2),
                 learning_rate=method_config.get('lr', 0.001),
                 batch_size=method_config.get('batch_size', 32),
-                max_epochs=method_config.get('epochs', 50),
+                max_epochs=method_config.get('max_epochs', method_config.get('epochs', 50)),
                 trainable_edit_embeddings=method_config.get('trainable_edit_embeddings', True),
                 trainable_edit_hidden_dims=method_config.get('trainable_edit_dims', [512, 256]),
                 trainable_edit_use_fragments=method_config.get('use_edit_fragments', False)

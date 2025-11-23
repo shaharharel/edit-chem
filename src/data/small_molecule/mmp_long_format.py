@@ -2,19 +2,20 @@
 Long-format MMP extraction optimized for efficiency.
 
 MINIMAL SCHEMA:
-    mol_a, mol_b, edit_smiles, edit_name, property_name, value_a, value_b, delta,
-    target_name, target_chembl_id
+    mol_a, mol_b, edit_smiles, num_cuts, property_name, value_a, value_b, delta,
+    target_name, target_chembl_id, doc_id_a, doc_id_b, assay_id_a, assay_id_b
 
 Fields:
     - mol_a, mol_b: Full molecule SMILES (for debugging, will convert to IDs later)
     - edit_smiles: Canonical reaction SMILES (e.g., "C>>CC") for encoding with ChemBERTa
                    Computed using RDKit MMP fragmentation + canonical SMILES
-    - edit_name: Canonical medicinal chemistry name (e.g., "homologation_C1_to_C2", "methylation")
-                 Falls back to edit_smiles if no canonical name exists
+    - num_cuts: Number of bond cuts used to generate this pair (1, 2, or 3)
     - property_name: Property being compared (e.g., "IC50_EGFR")
     - value_a, value_b: Property values
     - delta: value_b - value_a (observed change)
     - target_name, target_chembl_id: Target info (for bioactivity only)
+    - doc_id_a, doc_id_b: Document/publication IDs (for batch effect control)
+    - assay_id_a, assay_id_b: Assay IDs (for experimental protocol tracking)
 
 For edit embeddings:
     Option 1: Use edit_smiles directly with ChemBERTa/transformers
@@ -37,7 +38,6 @@ from collections import defaultdict
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdMMPA
 from tqdm import tqdm
-from .edit_vocabulary import get_edit_name
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +215,7 @@ class LongFormatMMPExtractor:
         if len(filtered_cores) == 0:
             logger.warning(f"  No cores with {min_molecules_per_core}+ molecules found!")
             return pd.DataFrame(columns=[
-                'mol_a', 'mol_b', 'edit_smiles', 'edit_name', 'property_name', 'value_a', 'value_b',
+                'mol_a', 'mol_b', 'edit_smiles', 'property_name', 'value_a', 'value_b',
                 'delta', 'target_name', 'target_chembl_id'
             ])
 
@@ -262,7 +262,7 @@ class LongFormatMMPExtractor:
             file_handle = open(checkpoint_file, mode, buffering=1024*1024)
 
             if mode == 'w':
-                file_handle.write("mol_a,mol_b,edit_smiles,edit_name,property_name,value_a,value_b,delta,target_name,target_chembl_id\n")
+                file_handle.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,delta,target_name,target_chembl_id,doc_id_a,doc_id_b,assay_id_a,assay_id_b\n")
 
         logger.info(f"  Total cores to process: {len(filtered_cores):,}")
         logger.info(f"  Flushing to disk every {micro_batch_size} pairs")
@@ -329,9 +329,10 @@ class LongFormatMMPExtractor:
                         if file_handle:
                             for row in batch_pairs:
                                 file_handle.write(
-                                    f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['edit_name']},"
+                                    f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
                                     f"{row['property_name']},{row['value_a']},{row['value_b']},"
-                                    f"{row['delta']},{row['target_name']},{row['target_chembl_id']}\n"
+                                    f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
+                                    f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']}\n"
                                 )
                             file_handle.flush()
 
@@ -346,9 +347,10 @@ class LongFormatMMPExtractor:
             if file_handle:
                 for row in batch_pairs:
                     file_handle.write(
-                        f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['edit_name']},"
+                        f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
                         f"{row['property_name']},{row['value_a']},{row['value_b']},"
-                        f"{row['delta']},{row['target_name']},{row['target_chembl_id']}\n"
+                        f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
+                        f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']}\n"
                     )
                 file_handle.flush()
 
@@ -377,8 +379,8 @@ class LongFormatMMPExtractor:
         else:
             # No checkpoint file (shouldn't happen)
             df_pairs_long = pd.DataFrame(columns=[
-                'mol_a', 'mol_b', 'edit_smiles', 'edit_name', 'property_name', 'value_a', 'value_b',
-                'delta', 'target_name', 'target_chembl_id'
+                'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name', 'value_a', 'value_b',
+                'delta', 'target_name', 'target_chembl_id', 'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b'
             ])
 
         if len(df_pairs_long) == 0:
@@ -455,16 +457,21 @@ class LongFormatMMPExtractor:
                 continue
 
             prop_name = row['property_name']
-            value = row['pchembl_value']
+            # Support both pchembl_value and standard_value
+            value = row.get('pchembl_value') or row.get('standard_value')
             target_name = row.get('target_name', '')
             target_chembl_id = row.get('target_chembl_id', '')
+            doc_id = row.get('doc_id')
+            assay_id = row.get('assay_id')
 
             if pd.notna(value):
-                # Store both value and target info
+                # Store value, target info, and batch tracking fields
                 lookup[smiles]['properties'][prop_name] = {
                     'value': value,
                     'target_name': target_name,
-                    'target_chembl_id': target_chembl_id
+                    'target_chembl_id': target_chembl_id,
+                    'doc_id': doc_id if pd.notna(doc_id) else None,
+                    'assay_id': assay_id if pd.notna(assay_id) else None
                 }
 
         return lookup
@@ -535,6 +542,9 @@ class LongFormatMMPExtractor:
         edit_from_parts = parts_a - parts_b
         edit_to_parts = parts_b - parts_a
 
+        # Calculate number of cuts (max of parts on either side)
+        num_cuts = max(len(edit_from_parts), len(edit_to_parts))
+
         # For max_cuts=1: filter to only accept single-cut pairs
         # (where only one fragment differs on each side)
         if self.max_cuts == 1:
@@ -562,9 +572,6 @@ class LongFormatMMPExtractor:
         # This IS the RDKit canonical way - MMP fragmentation + canonical SMILES
         edit_smiles = f"{edit_from}>>{edit_to}" if edit_from and edit_to else ''
 
-        # Get canonical medicinal chemistry name for this edit
-        edit_name = get_edit_name(edit_smiles) if edit_smiles else ''
-
         # Get properties for both molecules
         props_a = property_lookup[smiles_a]['properties']
         props_b = property_lookup[smiles_b]['properties']
@@ -591,15 +598,23 @@ class LongFormatMMPExtractor:
                 value_a = value_a_raw['value']
                 target_name = value_a_raw.get('target_name', '')
                 target_chembl_id = value_a_raw.get('target_chembl_id', '')
+                doc_id_a = value_a_raw.get('doc_id')
+                assay_id_a = value_a_raw.get('assay_id')
             else:
                 value_a = value_a_raw
                 target_name = ''
                 target_chembl_id = ''
+                doc_id_a = None
+                assay_id_a = None
 
             if isinstance(value_b_raw, dict):
                 value_b = value_b_raw['value']
+                doc_id_b = value_b_raw.get('doc_id')
+                assay_id_b = value_b_raw.get('assay_id')
             else:
                 value_b = value_b_raw
+                doc_id_b = None
+                assay_id_b = None
 
             # Skip if either is None/NaN
             if value_a is None or value_b is None:
@@ -611,18 +626,22 @@ class LongFormatMMPExtractor:
 
             delta = value_b - value_a
 
-            # MINIMAL SCHEMA - only essential fields + canonical edit representation
+            # MINIMAL SCHEMA - only essential fields + canonical edit representation + batch tracking
             row = {
                 'mol_a': smiles_a,
                 'mol_b': smiles_b,
                 'edit_smiles': edit_smiles,  # ⭐ CANONICAL: "C>>CC" for ChemBERTa encoding
-                'edit_name': edit_name,  # Canonical medicinal chemistry name
+                'num_cuts': num_cuts,  # Number of bond cuts (1, 2, or 3)
                 'property_name': prop_name,
                 'value_a': value_a,
                 'value_b': value_b,
                 'delta': delta,
                 'target_name': target_name,
-                'target_chembl_id': target_chembl_id
+                'target_chembl_id': target_chembl_id,
+                'doc_id_a': doc_id_a,  # Publication/study ID for molecule A measurement
+                'doc_id_b': doc_id_b,  # Publication/study ID for molecule B measurement
+                'assay_id_a': assay_id_a,  # Assay ID for molecule A measurement
+                'assay_id_b': assay_id_b  # Assay ID for molecule B measurement
             }
 
             rows.append(row)

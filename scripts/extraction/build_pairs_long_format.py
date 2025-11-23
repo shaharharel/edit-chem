@@ -22,7 +22,7 @@ import logging
 import argparse
 import pandas as pd
 from pathlib import Path
-from src.modalities.small_molecule.mmp_long_format import LongFormatMMPExtractor
+from src.data.small_molecule.mmp_long_format import LongFormatMMPExtractor
 
 logging.basicConfig(
     level=logging.INFO,

@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from typing import Dict
 import numpy as np
 import pandas as pd
+import gc
 from src.models import PropertyPredictor, EditEffectPredictor
 
 
@@ -38,39 +39,58 @@ def train_all_models(models: Dict, train_data: Dict, config, embeddings: Dict = 
             method_info['model'] = model
             print("✓ Model loaded successfully")
         elif method_type == 'baseline_property':
-            train_df_list = []
-            val_df_list = []
-            for prop in task_names:
-                train_df_list.append(train_data[prop]['train'])
-                val_df_list.append(train_data[prop]['val'])
+            # PropertyPredictor: mol → property (absolute values)
+            # Each pair (mol_a, mol_b, value_a, value_b) becomes 2 samples:
+            #   - Sample 1: (mol_a, value_a)
+            #   - Sample 2: (mol_b, value_b)
 
-            train_combined = pd.concat(train_df_list, ignore_index=True)
-            val_combined = pd.concat(val_df_list, ignore_index=True)
+            train_mol_list = []
+            train_val_list = []
+            val_mol_list = []
+            val_val_list = []
 
-            y_train = np.full((len(train_combined), num_tasks), np.nan, dtype=np.float32)
-            y_val = np.full((len(val_combined), num_tasks), np.nan, dtype=np.float32)
-
-            train_idx = 0
-            val_idx = 0
             for i, prop in enumerate(task_names):
                 train_prop = train_data[prop]['train']
                 val_prop = train_data[prop]['val']
 
-                y_train[train_idx:train_idx+len(train_prop), i] = train_prop['delta'].values
-                y_val[val_idx:val_idx+len(val_prop), i] = val_prop['delta'].values
+                # Training: expand pairs to molecules
+                for idx in range(len(train_prop)):
+                    # mol_a sample
+                    y_row = np.full(num_tasks, np.nan, dtype=np.float32)
+                    y_row[i] = train_prop.iloc[idx]['value_a']
+                    train_val_list.append(y_row)
+                    if embeddings:
+                        train_mol_list.append(embeddings[prop]['train']['mol_a'][idx])
 
-                train_idx += len(train_prop)
-                val_idx += len(val_prop)
+                    # mol_b sample
+                    y_row = np.full(num_tasks, np.nan, dtype=np.float32)
+                    y_row[i] = train_prop.iloc[idx]['value_b']
+                    train_val_list.append(y_row)
+                    if embeddings:
+                        train_mol_list.append(embeddings[prop]['train']['mol_b'][idx])
+
+                # Validation: expand pairs to molecules
+                for idx in range(len(val_prop)):
+                    # mol_a sample
+                    y_row = np.full(num_tasks, np.nan, dtype=np.float32)
+                    y_row[i] = val_prop.iloc[idx]['value_a']
+                    val_val_list.append(y_row)
+                    if embeddings:
+                        val_mol_list.append(embeddings[prop]['val']['mol_a'][idx])
+
+                    # mol_b sample
+                    y_row = np.full(num_tasks, np.nan, dtype=np.float32)
+                    y_row[i] = val_prop.iloc[idx]['value_b']
+                    val_val_list.append(y_row)
+                    if embeddings:
+                        val_mol_list.append(embeddings[prop]['val']['mol_b'][idx])
+
+            y_train = np.array(train_val_list, dtype=np.float32)
+            y_val = np.array(val_val_list, dtype=np.float32)
 
             if embeddings:
-                mol_emb_train_list = []
-                mol_emb_val_list = []
-                for prop in task_names:
-                    mol_emb_train_list.append(embeddings[prop]['train']['mol_b'])
-                    mol_emb_val_list.append(embeddings[prop]['val']['mol_b'])
-
-                mol_emb_train = np.vstack(mol_emb_train_list)
-                mol_emb_val = np.vstack(mol_emb_val_list)
+                mol_emb_train = np.array(train_mol_list, dtype=np.float32)
+                mol_emb_val = np.array(val_mol_list, dtype=np.float32)
 
                 model.fit(
                     mol_emb_train=mol_emb_train,
@@ -79,6 +99,11 @@ def train_all_models(models: Dict, train_data: Dict, config, embeddings: Dict = 
                     y_val=y_val,
                     verbose=True
                 )
+
+                # Free training arrays for baseline property predictor
+                del mol_emb_train, mol_emb_val, y_train, y_val
+                del train_mol_list, val_mol_list, train_val_list, val_val_list
+                gc.collect()
 
         elif method_type == 'edit_framework':
             train_df_list = []
@@ -116,13 +141,21 @@ def train_all_models(models: Dict, train_data: Dict, config, embeddings: Dict = 
                 for prop in task_names:
                     mol_emb_a_train_list.append(embeddings[prop]['train']['mol_a'])
                     mol_emb_b_train_list.append(embeddings[prop]['train']['mol_b'])
-                    mol_emb_a_val_list.append(embeddings[prop]['val']['mol_a'])
-                    mol_emb_b_val_list.append(embeddings[prop]['val']['mol_b'])
+                    # Only append validation if it has data
+                    if len(embeddings[prop]['val']['mol_a']) > 0:
+                        mol_emb_a_val_list.append(embeddings[prop]['val']['mol_a'])
+                        mol_emb_b_val_list.append(embeddings[prop]['val']['mol_b'])
 
                 mol_emb_a_train = np.vstack(mol_emb_a_train_list)
                 mol_emb_b_train = np.vstack(mol_emb_b_train_list)
-                mol_emb_a_val = np.vstack(mol_emb_a_val_list)
-                mol_emb_b_val = np.vstack(mol_emb_b_val_list)
+
+                # Only vstack validation if we have data
+                if len(mol_emb_a_val_list) > 0:
+                    mol_emb_a_val = np.vstack(mol_emb_a_val_list)
+                    mol_emb_b_val = np.vstack(mol_emb_b_val_list)
+                else:
+                    mol_emb_a_val = None
+                    mol_emb_b_val = None
 
                 if use_fragments:
                     edit_emb_a_train_list = []
@@ -131,39 +164,85 @@ def train_all_models(models: Dict, train_data: Dict, config, embeddings: Dict = 
                     edit_emb_b_val_list = []
 
                     for prop in task_names:
-                        edit_emb_a_train_list.append(embeddings[prop]['train']['edit_frag_a'])
-                        edit_emb_b_train_list.append(embeddings[prop]['train']['edit_frag_b'])
-                        edit_emb_a_val_list.append(embeddings[prop]['val']['edit_frag_a'])
-                        edit_emb_b_val_list.append(embeddings[prop]['val']['edit_frag_b'])
+                        # Skip empty embeddings
+                        if len(embeddings[prop]['train']['edit_frag_a']) > 0:
+                            edit_emb_a_train_list.append(embeddings[prop]['train']['edit_frag_a'])
+                            edit_emb_b_train_list.append(embeddings[prop]['train']['edit_frag_b'])
+                        if len(embeddings[prop]['val']['edit_frag_a']) > 0:
+                            edit_emb_a_val_list.append(embeddings[prop]['val']['edit_frag_a'])
+                            edit_emb_b_val_list.append(embeddings[prop]['val']['edit_frag_b'])
 
-                    edit_emb_a_train = np.vstack(edit_emb_a_train_list)
-                    edit_emb_b_train = np.vstack(edit_emb_b_train_list)
-                    edit_emb_a_val = np.vstack(edit_emb_a_val_list)
-                    edit_emb_b_val = np.vstack(edit_emb_b_val_list)
+                    # Only vstack if we have data
+                    if len(edit_emb_a_train_list) > 0:
+                        edit_emb_a_train = np.vstack(edit_emb_a_train_list)
+                        edit_emb_b_train = np.vstack(edit_emb_b_train_list)
+                    else:
+                        raise ValueError("No training data with edit fragments found")
 
-                    model.fit(
-                        mol_emb_a=mol_emb_a_train,
-                        mol_emb_b=mol_emb_b_train,
-                        delta_y=delta_train,
-                        mol_emb_a_val=mol_emb_a_val,
-                        mol_emb_b_val=mol_emb_b_val,
-                        delta_y_val=delta_val,
-                        edit_emb_a=edit_emb_a_train,
-                        edit_emb_b=edit_emb_b_train,
-                        edit_emb_a_val=edit_emb_a_val,
-                        edit_emb_b_val=edit_emb_b_val,
-                        verbose=True
-                    )
+                    if len(edit_emb_a_val_list) > 0:
+                        edit_emb_a_val = np.vstack(edit_emb_a_val_list)
+                        edit_emb_b_val = np.vstack(edit_emb_b_val_list)
+                    else:
+                        # No validation data - set to None
+                        edit_emb_a_val = None
+                        edit_emb_b_val = None
+
+                    if edit_emb_a_val is not None:
+                        model.fit(
+                            mol_emb_a=mol_emb_a_train,
+                            mol_emb_b=mol_emb_b_train,
+                            delta_y=delta_train,
+                            mol_emb_a_val=mol_emb_a_val,
+                            mol_emb_b_val=mol_emb_b_val,
+                            delta_y_val=delta_val,
+                            edit_emb_a=edit_emb_a_train,
+                            edit_emb_b=edit_emb_b_train,
+                            edit_emb_a_val=edit_emb_a_val,
+                            edit_emb_b_val=edit_emb_b_val,
+                            verbose=True
+                        )
+                    else:
+                        print("Warning: No validation data, training without validation")
+                        model.fit(
+                            mol_emb_a=mol_emb_a_train,
+                            mol_emb_b=mol_emb_b_train,
+                            delta_y=delta_train,
+                            edit_emb_a=edit_emb_a_train,
+                            edit_emb_b=edit_emb_b_train,
+                            verbose=True
+                        )
                 else:
-                    model.fit(
-                        mol_emb_a=mol_emb_a_train,
-                        mol_emb_b=mol_emb_b_train,
-                        delta_y=delta_train,
-                        mol_emb_a_val=mol_emb_a_val,
-                        mol_emb_b_val=mol_emb_b_val,
-                        delta_y_val=delta_val,
-                        verbose=True
-                    )
+                    # Check if we have validation data
+                    if mol_emb_a_val is not None:
+                        model.fit(
+                            mol_emb_a=mol_emb_a_train,
+                            mol_emb_b=mol_emb_b_train,
+                            delta_y=delta_train,
+                            mol_emb_a_val=mol_emb_a_val,
+                            mol_emb_b_val=mol_emb_b_val,
+                            delta_y_val=delta_val,
+                            verbose=True
+                        )
+                    else:
+                        print("Warning: No validation data, training without validation")
+                        model.fit(
+                            mol_emb_a=mol_emb_a_train,
+                            mol_emb_b=mol_emb_b_train,
+                            delta_y=delta_train,
+                            verbose=True
+                        )
+
+            # Free training arrays immediately after model.fit()
+            # These vstacked arrays are large and no longer needed
+            if method_type == 'edit_framework' and embeddings:
+                del mol_emb_a_train, mol_emb_b_train
+                if mol_emb_a_val is not None:
+                    del mol_emb_a_val, mol_emb_b_val
+                if use_fragments and 'edit_emb_a_train' in locals():
+                    del edit_emb_a_train, edit_emb_b_train
+                    if edit_emb_a_val is not None:
+                        del edit_emb_a_val, edit_emb_b_val
+                gc.collect()
 
         if config.save_models:
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)

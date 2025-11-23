@@ -24,11 +24,27 @@ def load_datasets(config) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFra
 
     df = df[df['property_name'].isin(selected_properties)]
 
-    edit_property_counts = df.groupby('edit_name')['property_name'].nunique()
+    edit_property_counts = df.groupby('edit_smiles')['property_name'].nunique()
     multi_property_edits = edit_property_counts[edit_property_counts > 1].index
-    df = df[df['edit_name'].isin(multi_property_edits)].copy()
+    df = df[df['edit_smiles'].isin(multi_property_edits)].copy()
 
     print(f"Filtered to {len(df):,} pairs with edits appearing in >1 property")
+
+    # Get splitter params, separating split() method args from __init__() args
+    splitter_params = config.splitter_params.get(config.splitter_type, {})
+
+    # Parameters that go to split() method, not __init__()
+    split_method_params = {}
+    init_params = {}
+
+    # Known split() method parameters (vary by splitter type)
+    split_param_names = {'property_col', 'smiles_col', 'target_col', 'time_col'}
+
+    for key, value in splitter_params.items():
+        if key in split_param_names:
+            split_method_params[key] = value
+        else:
+            init_params[key] = value
 
     splitter = get_splitter(
         config.splitter_type,
@@ -36,13 +52,13 @@ def load_datasets(config) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFra
         val_size=config.val_ratio,
         test_size=config.test_ratio,
         random_state=config.random_seed,
-        **config.splitter_params.get(config.splitter_type, {})
+        **init_params
     )
 
     for prop in selected_properties:
         prop_data = df[df['property_name'] == prop].copy()
 
-        train, val, test = splitter.split(prop_data, smiles_col='mol_a')
+        train, val, test = splitter.split(prop_data, smiles_col='mol_a', **split_method_params)
 
         train_data[prop] = {
             'train': train,

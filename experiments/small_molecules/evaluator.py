@@ -26,15 +26,26 @@ def evaluate_all_models(trained_models: Dict, train_data: Dict, test_datasets: D
             test_df = splits['test']
 
             if method_type == 'baseline_property':
-                smiles_test = test_df['mol_b'].tolist()
+                # PropertyPredictor predicts absolute values, so we need:
+                # 1. Predict value_a for mol_a
+                # 2. Predict value_b for mol_b
+                # 3. Compute predicted delta = value_b - value_a
+
+                smiles_a = test_df['mol_a'].tolist()
+                smiles_b = test_df['mol_b'].tolist()
                 y_true = test_df['delta'].values
 
                 if embeddings and prop in embeddings and 'test' in embeddings[prop]:
-                    mol_emb_test = embeddings[prop]['test']['mol_b']
-                    preds_all = model.predict(smiles_test, mol_emb=mol_emb_test)
+                    mol_emb_a = embeddings[prop]['test']['mol_a']
+                    mol_emb_b = embeddings[prop]['test']['mol_b']
+                    preds_a = model.predict(smiles_a, mol_emb=mol_emb_a)
+                    preds_b = model.predict(smiles_b, mol_emb=mol_emb_b)
                 else:
-                    preds_all = model.predict(smiles_test)
-                y_pred = preds_all[prop]
+                    preds_a = model.predict(smiles_a)
+                    preds_b = model.predict(smiles_b)
+
+                # Compute predicted delta
+                y_pred = preds_b[prop] - preds_a[prop]
 
             elif method_type == 'edit_framework':
                 smiles_a_test = test_df['mol_a'].tolist()
@@ -94,10 +105,12 @@ def evaluate_all_models(trained_models: Dict, train_data: Dict, test_datasets: D
                     continue
 
                 if method_type == 'baseline_property':
-                    smiles_test = prop_test_df['mol_b'].tolist()
+                    smiles_a = prop_test_df['mol_a'].tolist()
+                    smiles_b = prop_test_df['mol_b'].tolist()
                     y_true = prop_test_df['delta'].values
-                    preds_all = model.predict(smiles_test)
-                    y_pred = preds_all[prop]
+                    preds_a = model.predict(smiles_a)
+                    preds_b = model.predict(smiles_b)
+                    y_pred = preds_b[prop] - preds_a[prop]
 
                 elif method_type == 'edit_framework':
                     smiles_a_test = prop_test_df['mol_a'].tolist()
