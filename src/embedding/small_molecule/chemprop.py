@@ -6,11 +6,12 @@ Compatible with ChemProp v2.x API.
 """
 
 import numpy as np
+import torch.nn as nn
 from typing import Union, List, Optional
 from .base import MoleculeEmbedder
 
 
-class ChemPropEmbedder(MoleculeEmbedder):
+class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
     """
     ChemProp D-MPNN molecule embedder (v2.x compatible).
 
@@ -31,6 +32,10 @@ class ChemPropEmbedder(MoleculeEmbedder):
         morgan_radius: Morgan fingerprint radius (ChemProp default: 2)
         morgan_length: Morgan fingerprint length (ChemProp default: 2048)
         include_chirality: Include chirality in Morgan fingerprints (default: True)
+        device: Device for graph neural network ('cpu' or 'cuda')
+        trainable: Whether GNN parameters should be trainable (default: False)
+                  Only applies to featurizer_type='graph'. If True, gradients will
+                  backpropagate through the GNN during training. If False, GNN is frozen.
 
     """
 
@@ -42,8 +47,10 @@ class ChemPropEmbedder(MoleculeEmbedder):
         morgan_radius: int = 2,
         morgan_length: int = 2048,  # ChemProp default
         include_chirality: bool = True,
-        device: str = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
+        device: str = 'cpu',  # D-MPNN embedder runs on CPU (embeddings are cached anyway)
+        trainable: bool = False  # Whether to make GNN parameters trainable (only for graph featurizer)
     ):
+        super().__init__()  # Initialize nn.Module
         self.model_path = model_path
         self.batch_size = batch_size
         self.featurizer_type = featurizer_type
@@ -51,6 +58,7 @@ class ChemPropEmbedder(MoleculeEmbedder):
         self.morgan_length = morgan_length
         self.include_chirality = include_chirality
         self.device = device
+        self.trainable = trainable
 
         # Try to import ChemProp v2
         try:
@@ -113,30 +121,39 @@ class ChemPropEmbedder(MoleculeEmbedder):
             from chemprop.nn import BondMessagePassing, MeanAggregation
             import torch
 
-            print(f"Using ChemProp v2 D-MPNN graph embeddings (300-dim) on {self.device}")
+            trainable_str = "trainable" if self.trainable else "frozen"
+            print(f"Using ChemProp v2 D-MPNN graph embeddings (300-dim, {trainable_str}) on {self.device}")
 
             # Create graph featurizer
             self.featurizer = SimpleMoleculeMolGraphFeaturizer()
             d_v, d_e = self.featurizer.shape  # (72, 14)
 
             # Create message passing network (randomly initialized)
+            dropout = 0.1 if self.trainable else 0.0  # Add dropout if training
             self.message_passing = BondMessagePassing(
                 d_v=d_v,
                 d_e=d_e,
                 d_h=300,  # hidden dimension
                 depth=3,   # 3 message passing layers
-                dropout=0.0
+                dropout=dropout
             )
             self.aggregation = MeanAggregation()
 
-            # Move to GPU if available
+            # Move to device
             self.message_passing = self.message_passing.to(self.device)
             self.aggregation = self.aggregation.to(self.device)
 
-            # Set to eval mode (frozen - no training)
-            self.message_passing.eval()
-            for param in self.message_passing.parameters():
-                param.requires_grad = False
+            # Control trainability
+            if self.trainable:
+                # Set to training mode - parameters are trainable
+                self.message_passing.train()
+                print("  → GNN parameters are TRAINABLE (gradients will backpropagate)")
+            else:
+                # Set to eval mode (frozen - no training)
+                self.message_passing.eval()
+                for param in self.message_passing.parameters():
+                    param.requires_grad = False
+                print("  → GNN parameters are FROZEN (no gradient updates)")
 
             self._embedding_dim = 300
 
@@ -274,13 +291,23 @@ class ChemPropEmbedder(MoleculeEmbedder):
                     ])
                     continue
 
-                # Batch graphs and move to device
+                # Batch graphs
                 try:
                     batch_graph = BatchMolGraph(valid_graphs)
-                    # Use official ChemProp v2 .to() method to move graph to device
-                    batch_graph = batch_graph.to(self.device)
+
+                    # Debug: check if BatchMolGraph was created properly
+                    if batch_graph is None:
+                        print(f"Warning: BatchMolGraph creation returned None")
+                        embeddings.extend([
+                            np.zeros(self._embedding_dim, dtype=np.float32)
+                            for _ in batch_graphs
+                        ])
+                        continue
+
                 except Exception as e:
                     print(f"Error creating BatchMolGraph: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # If batching fails, use zeros for all
                     embeddings.extend([
                         np.zeros(self._embedding_dim, dtype=np.float32)
@@ -289,6 +316,8 @@ class ChemPropEmbedder(MoleculeEmbedder):
                     continue
 
                 # Forward through message passing
+                # The message_passing network is already on GPU, PyTorch should
+                # automatically move inputs from CPU to GPU as needed
                 h = self.message_passing(batch_graph)
 
                 # Aggregate to molecule-level embeddings
@@ -324,6 +353,35 @@ class ChemPropEmbedder(MoleculeEmbedder):
         elif self.featurizer_type == 'rdkit2d':
             return "chemprop_v2_rdkit2d_217"
         elif self.featurizer_type == 'graph':
-            return "chemprop_v2_dmpnn_300"
+            trainable_suffix = "_trainable" if self.trainable else "_frozen"
+            return f"chemprop_v2_dmpnn_300{trainable_suffix}"
         else:
             return f"chemprop_v2_{self.featurizer_type}_{self._embedding_dim}"
+
+    def freeze_gnn(self):
+        """
+        Freeze GNN parameters (stop gradient updates).
+        Only applicable when featurizer_type='graph'.
+        """
+        if self.featurizer_type == 'graph' and hasattr(self, 'message_passing'):
+            self.message_passing.eval()
+            for param in self.message_passing.parameters():
+                param.requires_grad = False
+            self.trainable = False
+            print("ChemProp GNN frozen (no gradient updates)")
+        else:
+            print("Warning: freeze_gnn() only applies to featurizer_type='graph'")
+
+    def unfreeze_gnn(self):
+        """
+        Unfreeze GNN parameters (enable gradient updates).
+        Only applicable when featurizer_type='graph'.
+        """
+        if self.featurizer_type == 'graph' and hasattr(self, 'message_passing'):
+            self.message_passing.train()
+            for param in self.message_passing.parameters():
+                param.requires_grad = True
+            self.trainable = True
+            print("ChemProp GNN unfrozen (gradients will backpropagate)")
+        else:
+            print("Warning: unfreeze_gnn() only applies to featurizer_type='graph'")

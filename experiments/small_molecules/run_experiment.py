@@ -16,7 +16,11 @@ def run_experiment(config: ExperimentConfig):
 
     train_data, test_datasets = load_datasets(config)
 
-    embedder = create_embedder(config.embedder_type)
+    embedder = create_embedder(
+        embedder_type=config.embedder_type,
+        trainable_gnn=config.trainable_gnn,
+        gnn_device=config.gnn_device
+    )
 
     models = create_models(config, train_data, embedder)
 

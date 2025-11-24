@@ -32,12 +32,16 @@ class EditEffectMLP(pl.LightningModule):
         edit_dim: Edit embedding dimension
         hidden_dims: Optional list of hidden dimensions. If None, auto-generates halving layers
         dropout: Dropout probability
-        learning_rate: Learning rate for Adam optimizer
+        learning_rate: Learning rate for Adam optimizer (MLP heads, default: 1e-3)
         activation: Activation function ('relu', 'elu', 'gelu')
         trainable_edit_layer: Optional TrainableEditEmbedder module
         n_tasks: Number of properties to predict (1 for single-task)
         task_names: Optional list of task names
         task_weights: Optional dict of task weights for loss
+        gnn_learning_rate: Learning rate for GNN parameters (default: 1e-5)
+                          Only used if mol_embedder is trainable
+        mol_embedder: Reference to molecule embedder (for parameter grouping)
+                     If provided and trainable, uses separate learning rates for GNN vs MLP
     """
 
     def __init__(
@@ -51,19 +55,25 @@ class EditEffectMLP(pl.LightningModule):
         trainable_edit_layer: Optional[nn.Module] = None,
         n_tasks: int = 1,
         task_names: Optional[List[str]] = None,
-        task_weights: Optional[dict] = None
+        task_weights: Optional[dict] = None,
+        gnn_learning_rate: Optional[float] = None,  # Separate LR for GNN (if mol_embedder is trainable)
+        mol_embedder: Optional[nn.Module] = None  # Reference to mol_embedder for parameter grouping
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['trainable_edit_layer'])
+        self.save_hyperparameters(ignore=['trainable_edit_layer', 'mol_embedder'])
 
         self.mol_dim = mol_dim
         self.edit_dim = edit_dim
         self.input_dim = mol_dim + edit_dim
         self.learning_rate = learning_rate
+        self.gnn_learning_rate = gnn_learning_rate if gnn_learning_rate is not None else 1e-5
         self.n_tasks = n_tasks
 
         # Trainable edit embedding layer
         self.trainable_edit_layer = trainable_edit_layer
+
+        # Molecule embedder (for separate GNN learning rate)
+        self.mol_embedder = mol_embedder
 
         # Task names
         if task_names is None:
@@ -371,7 +381,72 @@ class EditEffectMLP(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        # Check if we need separate learning rates for GNN
+        if self.mol_embedder is not None and hasattr(self.mol_embedder, 'trainable') and self.mol_embedder.trainable:
+            # Separate learning rates for GNN and MLP heads
+            param_groups = []
+
+            # GNN parameters (lower learning rate)
+            if hasattr(self.mol_embedder, 'message_passing'):
+                gnn_params = list(self.mol_embedder.message_passing.parameters())
+                gnn_trainable_params = [p for p in gnn_params if p.requires_grad]
+
+                if gnn_trainable_params:
+                    # Count GNN parameters
+                    gnn_param_count = sum(p.numel() for p in gnn_trainable_params)
+
+                    param_groups.append({
+                        'params': gnn_trainable_params,
+                        'lr': self.gnn_learning_rate,
+                        'name': 'gnn'
+                    })
+                    print(f"\n{'='*70}")
+                    print(f"OPTIMIZER SETUP:")
+                    print(f"  → GNN: {len(gnn_trainable_params)} tensors, {gnn_param_count:,} params (lr={self.gnn_learning_rate})")
+                else:
+                    print(f"\n{'='*70}")
+                    print(f"OPTIMIZER SETUP:")
+                    print(f"  ⚠️  WARNING: GNN has NO trainable parameters (all frozen)!")
+
+            # All other parameters (MLP heads, edit embedder, etc.) - higher learning rate
+            mlp_params = []
+            for name, param in self.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                # Skip GNN parameters (already added)
+                is_gnn_param = False
+                if hasattr(self.mol_embedder, 'message_passing'):
+                    for gnn_param in self.mol_embedder.message_passing.parameters():
+                        if param is gnn_param:
+                            is_gnn_param = True
+                            break
+
+                if not is_gnn_param:
+                    mlp_params.append(param)
+
+            if mlp_params:
+                mlp_param_count = sum(p.numel() for p in mlp_params)
+                param_groups.append({
+                    'params': mlp_params,
+                    'lr': self.learning_rate,
+                    'name': 'mlp_heads'
+                })
+                print(f"  → MLP: {len(mlp_params)} tensors, {mlp_param_count:,} params (lr={self.learning_rate})")
+                total_params = gnn_param_count + mlp_param_count if gnn_trainable_params else mlp_param_count
+                print(f"  → TOTAL: {total_params:,} trainable parameters")
+                print(f"{'='*70}\n")
+
+            optimizer = torch.optim.Adam(param_groups)
+        else:
+            # Single learning rate for all parameters
+            mlp_param_count = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            print(f"\n{'='*70}")
+            print(f"OPTIMIZER SETUP:")
+            print(f"  → MLP only: {mlp_param_count:,} params (lr={self.learning_rate})")
+            print(f"  → GNN: FROZEN (not included in optimizer)")
+            print(f"{'='*70}\n")
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
         # Learning rate scheduler with plateau reduction
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -443,6 +518,7 @@ class EditEffectPredictor:
         hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
+        gnn_learning_rate: Optional[float] = None,
         batch_size: int = 32,
         max_epochs: int = 100,
         device: Optional[str] = None,
@@ -460,7 +536,9 @@ class EditEffectPredictor:
             edit_embedder: EditEmbedder instance (not used if trainable_edit_embeddings=True)
             hidden_dims: Hidden layer dimensions (None for auto)
             dropout: Dropout probability
-            learning_rate: Learning rate
+            learning_rate: Learning rate for MLP heads (default: 1e-3)
+            gnn_learning_rate: Learning rate for GNN parameters (default: 1e-5)
+                              Only used if mol_embedder has trainable GNN
             batch_size: Batch size
             max_epochs: Maximum training epochs
             device: 'cuda', 'cpu', or None (auto-detect)
@@ -475,6 +553,7 @@ class EditEffectPredictor:
         self.hidden_dims = hidden_dims
         self.dropout = dropout
         self.learning_rate = learning_rate
+        self.gnn_learning_rate = gnn_learning_rate if gnn_learning_rate is not None else 1e-5
         self.batch_size = batch_size
         self.max_epochs = max_epochs
         self.trainable_edit_embeddings = trainable_edit_embeddings
@@ -714,6 +793,8 @@ class EditEffectPredictor:
             hidden_dims=self.hidden_dims,
             dropout=self.dropout,
             learning_rate=self.learning_rate,
+            gnn_learning_rate=self.gnn_learning_rate,
+            mol_embedder=self.mol_embedder,  # Pass embedder for parameter grouping
             trainable_edit_layer=trainable_edit_layer,
             n_tasks=self.n_tasks,
             task_names=self.task_names,

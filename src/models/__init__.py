@@ -8,6 +8,8 @@ from .predictors import (
     PropertyPredictorMLP,
     EditEffectPredictor,
     EditEffectMLP,
+    StructuredEditEffectPredictor,
+    StructuredEditEffectMLP,
 )
 
 # Multi-task architectures
@@ -27,6 +29,8 @@ __all__ = [
     'PropertyPredictorMLP',
     'EditEffectPredictor',
     'EditEffectMLP',
+    'StructuredEditEffectPredictor',
+    'StructuredEditEffectMLP',
 
     # Multi-task architectures
     'SharedBackbone',

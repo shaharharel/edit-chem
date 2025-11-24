@@ -1,9 +1,10 @@
 """
 Long-format MMP extraction optimized for efficiency.
 
-MINIMAL SCHEMA:
+SCHEMA:
     mol_a, mol_b, edit_smiles, num_cuts, property_name, value_a, value_b, delta,
-    target_name, target_chembl_id, doc_id_a, doc_id_b, assay_id_a, assay_id_b
+    target_name, target_chembl_id, doc_id_a, doc_id_b, assay_id_a, assay_id_b,
+    removed_atoms_A, added_atoms_B, attach_atoms_A, mapped_pairs
 
 Fields:
     - mol_a, mol_b: Full molecule SMILES (for debugging, will convert to IDs later)
@@ -16,11 +17,16 @@ Fields:
     - target_name, target_chembl_id: Target info (for bioactivity only)
     - doc_id_a, doc_id_b: Document/publication IDs (for batch effect control)
     - assay_id_a, assay_id_b: Assay IDs (for experimental protocol tracking)
+    - removed_atoms_A: Atom indices in mol_a of leaving fragment (semicolon-separated)
+    - added_atoms_B: Atom indices in mol_b of incoming fragment (semicolon-separated)
+    - attach_atoms_A: Attachment point atom indices in mol_a (semicolon-separated)
+    - mapped_pairs: Atom mapping tuples (a,b;c,d format) for changed region
 
 For edit embeddings:
     Option 1: Use edit_smiles directly with ChemBERTa/transformers
     Option 2: Compute fingerprint difference on-the-fly: fp(mol_b) - fp(mol_a)
     Option 3: Combined embedding: F(mol, edit) -> property_change
+    Option 4: Structured edit embedding using atom-level mapping (NEW)
 
 This eliminates NaN/missing issues and only stores what exists.
 """
@@ -36,8 +42,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdMMPA
+from rdkit.Chem import AllChem, rdMMPA, Descriptors
 from tqdm import tqdm
+from .mmp_atom_mapping_fast import extract_atom_mapping_fast, serialize_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -215,8 +222,9 @@ class LongFormatMMPExtractor:
         if len(filtered_cores) == 0:
             logger.warning(f"  No cores with {min_molecules_per_core}+ molecules found!")
             return pd.DataFrame(columns=[
-                'mol_a', 'mol_b', 'edit_smiles', 'property_name', 'value_a', 'value_b',
-                'delta', 'target_name', 'target_chembl_id'
+                'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name', 'value_a', 'value_b',
+                'delta', 'target_name', 'target_chembl_id', 'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b',
+                'removed_atoms_A', 'added_atoms_B', 'attach_atoms_A', 'mapped_pairs'
             ])
 
         core_sizes = [len(core_index[c]) for c in filtered_cores]
@@ -262,7 +270,7 @@ class LongFormatMMPExtractor:
             file_handle = open(checkpoint_file, mode, buffering=1024*1024)
 
             if mode == 'w':
-                file_handle.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,delta,target_name,target_chembl_id,doc_id_a,doc_id_b,assay_id_a,assay_id_b\n")
+                file_handle.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,delta,target_name,target_chembl_id,doc_id_a,doc_id_b,assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,attach_atoms_A,mapped_pairs\n")
 
         logger.info(f"  Total cores to process: {len(filtered_cores):,}")
         logger.info(f"  Flushing to disk every {micro_batch_size} pairs")
@@ -270,7 +278,18 @@ class LongFormatMMPExtractor:
 
         # Micro-batch for memory efficiency
         batch_pairs = []
+        all_pairs = []  # NEW: When no checkpoint, accumulate all pairs in memory
         mem_peak = mem_after_index
+
+        # DEBUG: Add counters for diagnostics
+        debug_counts = {
+            'checked': 0,
+            'no_lookup': 0,
+            'no_mw': 0,
+            'mw_filter': 0,
+            'extracted_called': 0,
+            'pairs_found': 0
+        }
 
         # Iterate over cores
         core_pbar = tqdm(filtered_cores, desc="Cores", position=0)
@@ -300,26 +319,35 @@ class LongFormatMMPExtractor:
                     smiles_a = smiles_list[i]
                     smiles_b = smiles_list[j]
 
+                    debug_counts['checked'] += 1
+
                     # Check MW filter
                     if smiles_a not in property_lookup or smiles_b not in property_lookup:
+                        debug_counts['no_lookup'] += 1
                         continue
 
                     mw_a = property_lookup[smiles_a]['properties'].get('mw')
                     mw_b = property_lookup[smiles_b]['properties'].get('mw')
 
                     if mw_a is None or mw_b is None:
+                        debug_counts['no_mw'] += 1
                         continue
 
                     if abs(mw_a - mw_b) > max_mw_delta:
+                        debug_counts['mw_filter'] += 1
                         continue
 
                     # Extract pair
+                    debug_counts['extracted_called'] += 1
                     pair_data = self._extract_single_pair(
                         smiles_a, smiles_b,
                         fragments[smiles_a], fragments[smiles_b],
                         property_lookup,
                         property_filter
                     )
+
+                    if pair_data:
+                        debug_counts['pairs_found'] += len(pair_data)
 
                     if pair_data:
                         batch_pairs.extend(pair_data)
@@ -332,9 +360,13 @@ class LongFormatMMPExtractor:
                                     f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
                                     f"{row['property_name']},{row['value_a']},{row['value_b']},"
                                     f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
-                                    f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']}\n"
+                                    f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']},"
+                                    f"{row['removed_atoms_A']},{row['added_atoms_B']},{row['attach_atoms_A']},{row['mapped_pairs']}\n"
                                 )
                             file_handle.flush()
+                        else:
+                            # No checkpoint file - accumulate in memory
+                            all_pairs.extend(batch_pairs)
 
                         total_pairs_written += len(batch_pairs)
                         batch_pairs = []
@@ -350,9 +382,13 @@ class LongFormatMMPExtractor:
                         f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
                         f"{row['property_name']},{row['value_a']},{row['value_b']},"
                         f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
-                        f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']}\n"
+                        f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']},"
+                        f"{row['removed_atoms_A']},{row['added_atoms_B']},{row['attach_atoms_A']},{row['mapped_pairs']}\n"
                     )
                 file_handle.flush()
+            else:
+                # No checkpoint file - accumulate in memory
+                all_pairs.extend(batch_pairs)
 
             total_pairs_written += len(batch_pairs)
             batch_pairs = []
@@ -367,6 +403,16 @@ class LongFormatMMPExtractor:
         logger.info(f"  Peak memory during extraction: {mem_peak:.1f} MB")
         logger.info("")
 
+        # DEBUG: Print diagnostic counts
+        logger.info("  DEBUG: Pair extraction diagnostics:")
+        logger.info(f"    Pairs checked: {debug_counts['checked']:,}")
+        logger.info(f"    Filtered (no lookup): {debug_counts['no_lookup']:,}")
+        logger.info(f"    Filtered (no MW): {debug_counts['no_mw']:,}")
+        logger.info(f"    Filtered (MW delta): {debug_counts['mw_filter']:,}")
+        logger.info(f"    _extract_single_pair called: {debug_counts['extracted_called']:,}")
+        logger.info(f"    Pairs found: {debug_counts['pairs_found']:,}")
+        logger.info("")
+
         # Read final result from checkpoint (in chunks to avoid memory spike)
         if checkpoint_file and checkpoint_file.exists():
             logger.info("  Reading final result from disk...")
@@ -377,11 +423,17 @@ class LongFormatMMPExtractor:
             logger.info("  Cleaned up checkpoint file")
             logger.info("")
         else:
-            # No checkpoint file (shouldn't happen)
-            df_pairs_long = pd.DataFrame(columns=[
-                'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name', 'value_a', 'value_b',
-                'delta', 'target_name', 'target_chembl_id', 'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b'
-            ])
+            # No checkpoint file - convert from memory-accumulated pairs
+            if all_pairs:
+                logger.info("  Converting accumulated pairs to DataFrame...")
+                df_pairs_long = pd.DataFrame(all_pairs)
+                logger.info("")
+            else:
+                df_pairs_long = pd.DataFrame(columns=[
+                    'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name', 'value_a', 'value_b',
+                    'delta', 'target_name', 'target_chembl_id', 'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b',
+                    'removed_atoms_A', 'added_atoms_B', 'attach_atoms_A', 'mapped_pairs'
+                ])
 
         if len(df_pairs_long) == 0:
             logger.warning("  No pairs found!")
@@ -446,6 +498,17 @@ class LongFormatMMPExtractor:
                 if prop in row and pd.notna(row[prop]):
                     lookup[smiles]['properties'][prop] = row[prop]
 
+            # CRITICAL: Compute MW on-the-fly if not provided in molecules_df
+            # This is required for the MW filter in pair extraction
+            if 'mw' not in lookup[smiles]['properties']:
+                try:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is not None:
+                        lookup[smiles]['properties']['mw'] = Descriptors.MolWt(mol)
+                except Exception as e:
+                    logger.debug(f"MW computation failed for {smiles[:30]}: {e}")
+                    pass  # Skip if MW computation fails
+
         # Bioactivity properties (with target info)
         # Use vectorized operations instead of iterrows for better performance
         for _, row in bioactivity_df.iterrows():
@@ -473,6 +536,10 @@ class LongFormatMMPExtractor:
                     'doc_id': doc_id if pd.notna(doc_id) else None,
                     'assay_id': assay_id if pd.notna(assay_id) else None
                 }
+
+        # DEBUG: Check how many molecules have MW computed
+        molecules_with_mw = sum(1 for data in lookup.values() if 'mw' in data['properties'])
+        logger.info(f"  MW computed for {molecules_with_mw}/{len(lookup)} molecules")
 
         return lookup
 
@@ -502,8 +569,10 @@ class LongFormatMMPExtractor:
 
         if not common_cores:
             # Try all combinations of fragments to find if any share common parts
+            # Find the LARGEST common core (most atoms)
             attachment_a = None
             attachment_b = None
+            best_core_size = 0
 
             for core_a, chains_a in frags_a.items():
                 for core_b, chains_b in frags_b.items():
@@ -515,12 +584,22 @@ class LongFormatMMPExtractor:
                     common_parts = parts_a & parts_b
 
                     if common_parts and len(common_parts) > 0:
-                        # Found a shared structure
-                        attachment_a = chains_a
-                        attachment_b = chains_b
-                        break
-                if attachment_a:
-                    break
+                        # Calculate core size (number of atoms in common parts)
+                        core_size = 0
+                        for part in common_parts:
+                            part_clean = part.replace('[*:1]', '[H]').replace('[*:2]', '[H]').replace('[*:3]', '[H]')
+                            try:
+                                mol_part = Chem.MolFromSmiles(part_clean)
+                                if mol_part:
+                                    core_size += mol_part.GetNumAtoms()
+                            except:
+                                pass
+
+                        # Keep the largest core
+                        if core_size > best_core_size:
+                            best_core_size = core_size
+                            attachment_a = chains_a
+                            attachment_b = chains_b
 
             if not attachment_a:
                 return []  # No valid MMP found
@@ -571,6 +650,21 @@ class LongFormatMMPExtractor:
         # Format: reactant>>product
         # This IS the RDKit canonical way - MMP fragmentation + canonical SMILES
         edit_smiles = f"{edit_from}>>{edit_to}" if edit_from and edit_to else ''
+
+        # Extract atom-level mapping for structured edit predictor
+        # Use FAST version that leverages MMP core data directly (84x faster!)
+        common_parts = parts_a & parts_b
+
+        # Join multiple common parts with '.' (for multi-cut pairs)
+        # Sort for consistency
+        core_smiles = '.'.join(sorted(common_parts)) if common_parts else ""
+        removed_fragment = '.'.join(sorted(edit_from_parts)) if edit_from_parts else ""
+        added_fragment = '.'.join(sorted(edit_to_parts)) if edit_to_parts else ""
+
+        atom_mapping = extract_atom_mapping_fast(
+            smiles_a, smiles_b, core_smiles, removed_fragment, added_fragment, num_cuts
+        )
+        atom_mapping_serialized = serialize_mapping(atom_mapping)
 
         # Get properties for both molecules
         props_a = property_lookup[smiles_a]['properties']
@@ -641,7 +735,12 @@ class LongFormatMMPExtractor:
                 'doc_id_a': doc_id_a,  # Publication/study ID for molecule A measurement
                 'doc_id_b': doc_id_b,  # Publication/study ID for molecule B measurement
                 'assay_id_a': assay_id_a,  # Assay ID for molecule A measurement
-                'assay_id_b': assay_id_b  # Assay ID for molecule B measurement
+                'assay_id_b': assay_id_b,  # Assay ID for molecule B measurement
+                # Atom-level mapping for structured edit predictor
+                'removed_atoms_A': atom_mapping_serialized['removed_atoms_A'],
+                'added_atoms_B': atom_mapping_serialized['added_atoms_B'],
+                'attach_atoms_A': atom_mapping_serialized['attach_atoms_A'],
+                'mapped_pairs': atom_mapping_serialized['mapped_pairs']
             }
 
             rows.append(row)

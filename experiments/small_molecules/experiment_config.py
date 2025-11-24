@@ -24,6 +24,8 @@ class ExperimentConfig:
     save_models: bool = False
     models_dir: str = "models"
     embedder_type: str = 'chemprop'
+    trainable_gnn: bool = False  # Whether to make GNN trainable (only for chemprop_dmpnn)
+    gnn_device: str = 'auto'  # Device for GNN ('cpu', 'cuda', or 'auto' for auto-detect)
     include_cluster_analysis: bool = True
     n_clusters: int = 4
     include_edit_embedding_comparison: bool = True

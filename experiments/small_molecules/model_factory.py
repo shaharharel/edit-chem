@@ -7,7 +7,21 @@ from src.models import PropertyPredictor, EditEffectPredictor
 from src.embedding.small_molecule import ChemBERTaEmbedder, ChemPropEmbedder, EditEmbedder
 
 
-def create_embedder(embedder_type: str):
+def create_embedder(embedder_type: str, trainable_gnn: bool = False, gnn_device: str = 'auto'):
+    """
+    Create molecule embedder with optional trainable GNN.
+
+    Args:
+        embedder_type: Type of embedder ('chemberta', 'chemprop', 'chemprop_dmpnn', etc.)
+        trainable_gnn: Whether to make GNN parameters trainable (only for graph-based embedders)
+        gnn_device: Device for GNN ('cpu', 'cuda', or 'auto' for auto-detect)
+    """
+    # Auto-detect device if requested
+    if gnn_device == 'auto':
+        import torch
+        gnn_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Auto-detected device: {gnn_device}")
+
     if embedder_type == 'chemberta':
         return ChemBERTaEmbedder()
     elif embedder_type == 'chemprop':
@@ -15,7 +29,11 @@ def create_embedder(embedder_type: str):
         return ChemPropEmbedder()
     elif embedder_type == 'chemprop_dmpnn':
         # D-MPNN graph neural network (GPU-capable, 300-dim)
-        return ChemPropEmbedder(featurizer_type='graph')
+        return ChemPropEmbedder(
+            featurizer_type='graph',
+            trainable=trainable_gnn,
+            device=gnn_device
+        )
     elif embedder_type == 'chemprop_morgan':
         # Explicit Morgan fingerprints (same as 'chemprop' default)
         return ChemPropEmbedder(featurizer_type='morgan')
@@ -62,6 +80,7 @@ def create_models(config, train_data: Dict, embedder) -> Dict:
                 hidden_dims=method_config.get('hidden_dims'),
                 dropout=method_config.get('dropout', 0.2),
                 learning_rate=method_config.get('lr', 0.001),
+                gnn_learning_rate=method_config.get('gnn_lr', 1e-5),  # Separate LR for GNN
                 batch_size=method_config.get('batch_size', 32),
                 max_epochs=method_config.get('max_epochs', method_config.get('epochs', 50)),
                 trainable_edit_embeddings=method_config.get('trainable_edit_embeddings', True),

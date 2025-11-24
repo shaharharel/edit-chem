@@ -44,7 +44,8 @@ def main():
                     'use_edit_fragments': False,
                     'hidden_dims': [512, 256, 128],
                     'dropout': 0.1,
-                    'lr': 0.001,
+                    'lr': 0.001,  # Learning rate for MLP heads
+                    'gnn_lr': 1e-5,  # Learning rate for GNN (if trainable)
                     'batch_size': 128,
                     'max_epochs': 10
                 },
@@ -54,7 +55,8 @@ def main():
                     'use_edit_fragments': True,
                     'hidden_dims': [512, 256, 128],
                     'dropout': 0.1,
-                    'lr': 0.001,
+                    'lr': 0.001,  # Learning rate for MLP heads
+                    'gnn_lr': 1e-5,  # Learning rate for GNN (if trainable)
                     'batch_size': 128,
                     'max_epochs': 10
                 },
@@ -70,6 +72,8 @@ def main():
             ],
 
             embedder_type='chemprop_dmpnn',
+            trainable_gnn=True,  # Set to True to train GNN end-to-end
+            gnn_device='auto',  # 'auto' (default), 'cuda', or 'cpu'
 
             metrics=['mae', 'rmse', 'r2', 'pearson_r', 'spearman_r'],
 
