@@ -561,6 +561,274 @@ class TemporalSplitter(MolecularSplitter):
         return train, val, test
 
 
+class FewShotTargetSplitter(MolecularSplitter):
+    """
+    Few-shot target split for testing generalization to new targets with limited training data.
+
+    This splitter creates a challenging scenario where:
+    - A subset of targets (30% by default) are selected for few-shot learning
+    - Only a limited number of examples (configurable: 100 or 1000) from these targets go to training
+    - The remaining examples from these targets are split between validation and test
+    - This tests the model's ability to generalize to new targets with few training examples
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        few_shot_target_fraction: float = 0.3,
+        few_shot_samples: int = 100
+    ):
+        """
+        Initialize few-shot target splitter.
+
+        Args:
+            few_shot_target_fraction: Fraction of targets to use for few-shot learning (default: 0.3)
+            few_shot_samples: Number of training samples from few-shot targets (default: 100)
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.few_shot_target_fraction = few_shot_target_fraction
+        self.few_shot_samples = few_shot_samples
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        target_col: str = 'target_id',
+        smiles_col: str = 'smiles'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split with few-shot learning scenario for selected targets.
+
+        Args:
+            df: DataFrame with columns [smiles, target_id, ...]
+            target_col: Column name for target identifier
+        """
+        if target_col not in df.columns:
+            raise ValueError(
+                f"target_col '{target_col}' not found in DataFrame. "
+                f"Available columns: {df.columns.tolist()}"
+            )
+
+        print(f"Few-shot target split ({target_col})...")
+        print(f"  Few-shot target fraction: {self.few_shot_target_fraction}")
+        print(f"  Few-shot samples per target: {self.few_shot_samples}")
+
+        # Get unique targets
+        unique_targets = df[target_col].unique()
+        n_targets = len(unique_targets)
+
+        # Randomly select targets for few-shot learning
+        np.random.seed(self.random_state)
+        n_few_shot_targets = max(1, int(n_targets * self.few_shot_target_fraction))
+        few_shot_targets = np.random.choice(unique_targets, size=n_few_shot_targets, replace=False)
+
+        print(f"  Total targets: {n_targets}")
+        print(f"  Few-shot targets: {n_few_shot_targets}")
+
+        # Split data based on target type
+        few_shot_mask = df[target_col].isin(few_shot_targets)
+        regular_targets_df = df[~few_shot_mask].copy()
+        few_shot_targets_df = df[few_shot_mask].copy()
+
+        print(f"  Regular target samples: {len(regular_targets_df):,}")
+        print(f"  Few-shot target samples: {len(few_shot_targets_df):,}")
+
+        # Split regular targets normally (70/15/15)
+        if len(regular_targets_df) > 0:
+            target_to_indices = defaultdict(list)
+            for idx, target in enumerate(regular_targets_df[target_col]):
+                target_to_indices[target].append(idx)
+
+            # Sort by size
+            target_sizes = [(target, len(indices))
+                           for target, indices in target_to_indices.items()]
+            target_sizes.sort(key=lambda x: x[1], reverse=True)
+
+            n_regular = len(regular_targets_df)
+            target_train = int(n_regular * self.train_size)
+            target_val = int(n_regular * self.val_size)
+
+            train_idx_regular, val_idx_regular, test_idx_regular = [], [], []
+            train_count, val_count = 0, 0
+
+            np.random.shuffle(target_sizes)
+
+            for target, size in target_sizes:
+                indices = target_to_indices[target]
+                if train_count < target_train:
+                    train_idx_regular.extend(indices)
+                    train_count += size
+                elif val_count < target_val:
+                    val_idx_regular.extend(indices)
+                    val_count += size
+                else:
+                    test_idx_regular.extend(indices)
+
+            train_regular = regular_targets_df.iloc[train_idx_regular].reset_index(drop=True)
+            val_regular = regular_targets_df.iloc[val_idx_regular].reset_index(drop=True)
+            test_regular = regular_targets_df.iloc[test_idx_regular].reset_index(drop=True)
+        else:
+            train_regular = pd.DataFrame(columns=df.columns)
+            val_regular = pd.DataFrame(columns=df.columns)
+            test_regular = pd.DataFrame(columns=df.columns)
+
+        # Handle few-shot targets: sample limited training examples, rest to val/test
+        train_few_shot_list = []
+        val_test_few_shot_list = []
+
+        for target in few_shot_targets:
+            target_df = few_shot_targets_df[few_shot_targets_df[target_col] == target]
+
+            # Sample training examples (up to few_shot_samples)
+            n_train_samples = min(self.few_shot_samples, len(target_df))
+
+            # Shuffle indices for this target
+            indices = np.arange(len(target_df))
+            np.random.seed(self.random_state + hash(str(target)) % 10000)
+            np.random.shuffle(indices)
+
+            # Split
+            train_indices = indices[:n_train_samples]
+            remaining_indices = indices[n_train_samples:]
+
+            train_few_shot_list.append(target_df.iloc[train_indices])
+
+            if len(remaining_indices) > 0:
+                val_test_few_shot_list.append(target_df.iloc[remaining_indices])
+
+        # Combine few-shot training with regular training
+        if train_few_shot_list:
+            train_few_shot = pd.concat(train_few_shot_list, ignore_index=True)
+        else:
+            train_few_shot = pd.DataFrame(columns=df.columns)
+
+        # Split remaining few-shot samples between val and test
+        if val_test_few_shot_list:
+            val_test_few_shot = pd.concat(val_test_few_shot_list, ignore_index=True)
+
+            # Use relative proportions for val/test
+            val_fraction = self.val_size / (self.val_size + self.test_size)
+            n_val = int(len(val_test_few_shot) * val_fraction)
+
+            indices = np.arange(len(val_test_few_shot))
+            np.random.seed(self.random_state)
+            np.random.shuffle(indices)
+
+            val_few_shot = val_test_few_shot.iloc[indices[:n_val]].reset_index(drop=True)
+            test_few_shot = val_test_few_shot.iloc[indices[n_val:]].reset_index(drop=True)
+        else:
+            val_few_shot = pd.DataFrame(columns=df.columns)
+            test_few_shot = pd.DataFrame(columns=df.columns)
+
+        # Combine all splits
+        train = pd.concat([train_regular, train_few_shot], ignore_index=True)
+        val = pd.concat([val_regular, val_few_shot], ignore_index=True)
+        test = pd.concat([test_regular, test_few_shot], ignore_index=True)
+
+        # Shuffle final splits
+        train = train.sample(frac=1, random_state=self.random_state).reset_index(drop=True)
+        val = val.sample(frac=1, random_state=self.random_state).reset_index(drop=True)
+        test = test.sample(frac=1, random_state=self.random_state).reset_index(drop=True)
+
+        print(f"  Final split sizes: train={len(train)}, val={len(val)}, test={len(test)}")
+        print(f"    Train few-shot samples: {len(train_few_shot)}")
+        print(f"    Val few-shot samples: {len(val_few_shot)}")
+        print(f"    Test few-shot samples: {len(test_few_shot)}")
+
+        return train, val, test
+
+
+class CoreSplitter(MolecularSplitter):
+    """
+    Core-based split for testing generalization to novel chemical cores.
+
+    This splitter ensures that molecules with unique chemical cores are assigned
+    exclusively to validation and test sets. This tests the model's ability to
+    generalize to completely novel core structures not seen during training.
+    """
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        core_col: str = 'core',
+        smiles_col: str = 'smiles'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by chemical cores, ensuring unique cores in val/test.
+
+        Args:
+            df: DataFrame with columns [smiles, core, ...]
+            core_col: Column name for core identifier (e.g., Bemis-Murcko scaffold)
+        """
+        if core_col not in df.columns:
+            raise ValueError(
+                f"core_col '{core_col}' not found in DataFrame. "
+                f"Available columns: {df.columns.tolist()}"
+            )
+
+        print(f"Core-based split ({core_col})...")
+
+        # Group by core
+        core_to_indices = defaultdict(list)
+        for idx, core in enumerate(df[core_col]):
+            if pd.notna(core):  # Skip NaN cores
+                core_to_indices[core].append(idx)
+
+        # Sort cores by size (descending)
+        core_sizes = [(core, len(indices))
+                     for core, indices in core_to_indices.items()]
+        core_sizes.sort(key=lambda x: x[1], reverse=True)
+
+        print(f"  Found {len(core_sizes)} unique cores")
+        print(f"  Largest core: {core_sizes[0][1]} molecules")
+        print(f"  Smallest core: {core_sizes[-1][1]} molecules")
+
+        # Allocate cores to splits (greedy algorithm to balance sizes)
+        n = len(df)
+        target_train = int(n * self.train_size)
+        target_val = int(n * self.val_size)
+
+        train_idx, val_idx, test_idx = [], [], []
+        train_count, val_count, test_count = 0, 0, 0
+
+        # Shuffle cores for randomization
+        np.random.seed(self.random_state)
+        np.random.shuffle(core_sizes)
+
+        for core, size in core_sizes:
+            indices = core_to_indices[core]
+
+            # Assign entire core to one split (no core leakage between splits)
+            if train_count < target_train:
+                train_idx.extend(indices)
+                train_count += size
+            elif val_count < target_val:
+                val_idx.extend(indices)
+                val_count += size
+            else:
+                test_idx.extend(indices)
+                test_count += size
+
+        print(f"  Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+        # Get unique cores per split for verification
+        train_cores = df.iloc[train_idx][core_col].nunique()
+        val_cores = df.iloc[val_idx][core_col].nunique()
+        test_cores = df.iloc[test_idx][core_col].nunique()
+
+        print(f"  Unique cores: train={train_cores}, val={val_cores}, test={test_cores}")
+        print(f"  ✓ No core overlap between splits (strict generalization test)")
+
+        return self._split_indices_to_dataframes(
+            df,
+            np.array(train_idx),
+            np.array(val_idx),
+            np.array(test_idx)
+        )
+
+
 def get_splitter(
     split_type: str,
     train_size: float = 0.7,
@@ -574,10 +842,17 @@ def get_splitter(
 
     Args:
         split_type: One of ['random', 'scaffold', 'target', 'butina',
-                    'stratified', 'temporal']
+                    'stratified', 'temporal', 'few_shot_target', 'core']
         train_size, val_size, test_size: Split fractions
         random_state: Random seed
         **kwargs: Additional arguments for specific splitters
+                 - few_shot_target: few_shot_target_fraction, few_shot_samples
+                 - core: core_col
+                 - target: target_col
+                 - stratified: property_col, n_bins
+                 - temporal: time_col
+                 - scaffold: use_generic
+                 - butina: cutoff, fp_radius, fp_size
 
     Returns:
         MolecularSplitter instance
@@ -585,6 +860,12 @@ def get_splitter(
     Example:
         >>> splitter = get_splitter('scaffold', use_generic=True)
         >>> train, val, test = splitter.split(df, smiles_col='smiles')
+
+        >>> splitter = get_splitter('few_shot_target', few_shot_samples=100)
+        >>> train, val, test = splitter.split(df, target_col='target_chembl_id')
+
+        >>> splitter = get_splitter('core')
+        >>> train, val, test = splitter.split(df, core_col='core')
     """
     splitters = {
         'random': RandomSplitter,
@@ -592,7 +873,9 @@ def get_splitter(
         'target': TargetSplitter,
         'butina': ButinaSplitter,
         'stratified': PropertyStratifiedSplitter,
-        'temporal': TemporalSplitter
+        'temporal': TemporalSplitter,
+        'few_shot_target': FewShotTargetSplitter,
+        'core': CoreSplitter
     }
 
     if split_type not in splitters:

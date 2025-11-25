@@ -24,6 +24,8 @@ from .splits import (
     ButinaSplitter,
     PropertyStratifiedSplitter,
     TemporalSplitter,
+    FewShotTargetSplitter,
+    CoreSplitter,
     get_splitter
 )
 from .metrics import (
@@ -51,6 +53,8 @@ __all__ = [
     'ButinaSplitter',
     'PropertyStratifiedSplitter',
     'TemporalSplitter',
+    'FewShotTargetSplitter',
+    'CoreSplitter',
     'get_splitter',
     'RegressionMetrics',
     'MultiTaskMetrics',

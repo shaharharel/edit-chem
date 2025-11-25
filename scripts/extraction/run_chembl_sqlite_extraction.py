@@ -20,6 +20,13 @@ Usage:
         --top-n-targets 5 \\
         --output-dir data/pairs
 
+    # Extract only CSV files (skip MMP pair extraction)
+    python scripts/extraction/run_chembl_sqlite_extraction.py \\
+        --db-path data/small_molecules/chembl_db/chembl/36/chembl_36.db \\
+        --top-n-targets 5 \\
+        --output-dir data/chembl \\
+        --csv-only
+
     # Use existing CSV files
     python scripts/extraction/run_chembl_sqlite_extraction.py \\
         --molecules-file data/chembl/molecules.csv \\
@@ -32,11 +39,19 @@ Usage:
         --specific-targets CHEMBL203 CHEMBL217 \\
         --output-dir data/pairs
 
-    # Sample extraction (limit molecules per target)
+    # Sample extraction - 1000 molecules TOTAL (random across all targets)
     python scripts/extraction/run_chembl_sqlite_extraction.py \\
         --db-path data/small_molecules/chembl_db/chembl/36/chembl_36.db \\
         --top-n-targets 3 \\
-        --sample-size 5000 \\
+        --sample-size 1000 \\
+        --output-dir data/pairs
+
+    # Sample extraction - 1000 molecules PER target (balanced, 3000 total)
+    python scripts/extraction/run_chembl_sqlite_extraction.py \\
+        --db-path data/small_molecules/chembl_db/chembl/36/chembl_36.db \\
+        --top-n-targets 3 \\
+        --sample-size 1000 \\
+        --sample-per-target \\
         --output-dir data/pairs
 """
 
@@ -102,31 +117,77 @@ class SQLiteChEMBLExtractor:
     def extract_molecules_for_targets(
         self,
         target_ids: List[str],
-        sample_size: Optional[int] = None
+        sample_size: Optional[int] = None,
+        sample_per_target: bool = False
     ) -> pd.DataFrame:
-        """Extract molecules for specific targets."""
+        """
+        Extract molecules for specific targets.
 
-        target_list = ','.join([f"'{tid}'" for tid in target_ids])
+        Args:
+            target_ids: List of target ChEMBL IDs
+            sample_size: Number of molecules to sample
+            sample_per_target: If True, sample N molecules per target (balanced).
+                              If False, sample N total across all targets (may be unbalanced).
 
-        query = f"""
-        SELECT DISTINCT
-            md.chembl_id,
-            cs.canonical_smiles as smiles
-        FROM compound_structures cs
-        JOIN molecule_dictionary md ON cs.molregno = md.molregno
-        JOIN activities act ON cs.molregno = act.molregno
-        JOIN assays ass ON act.assay_id = ass.assay_id
-        JOIN target_dictionary td ON ass.tid = td.tid
-        WHERE cs.canonical_smiles IS NOT NULL
-            AND act.pchembl_value IS NOT NULL
-            AND td.chembl_id IN ({target_list})
+        Examples:
+            # 1000 molecules PER target (5 targets = 5000 total)
+            extract_molecules_for_targets(['CHEMBL203', ...], sample_size=1000, sample_per_target=True)
+
+            # 1000 molecules TOTAL across all targets (random sampling)
+            extract_molecules_for_targets(['CHEMBL203', ...], sample_size=1000, sample_per_target=False)
         """
 
-        if sample_size:
-            query += f" LIMIT {sample_size}"
+        if sample_per_target and sample_size:
+            # Balanced sampling: N molecules per target
+            all_molecules = []
 
-        df = pd.read_sql_query(query, self.conn)
-        logger.info(f"Extracted {len(df):,} unique molecules")
+            for target_id in target_ids:
+                query = f"""
+                SELECT DISTINCT
+                    md.chembl_id,
+                    cs.canonical_smiles as smiles
+                FROM compound_structures cs
+                JOIN molecule_dictionary md ON cs.molregno = md.molregno
+                JOIN activities act ON cs.molregno = act.molregno
+                JOIN assays ass ON act.assay_id = ass.assay_id
+                JOIN target_dictionary td ON ass.tid = td.tid
+                WHERE cs.canonical_smiles IS NOT NULL
+                    AND act.pchembl_value IS NOT NULL
+                    AND td.chembl_id = '{target_id}'
+                ORDER BY RANDOM()
+                LIMIT {sample_size}
+                """
+
+                target_df = pd.read_sql_query(query, self.conn)
+                all_molecules.append(target_df)
+                logger.info(f"  {target_id}: {len(target_df):,} molecules")
+
+            df = pd.concat(all_molecules, ignore_index=True).drop_duplicates(subset=['chembl_id'])
+            logger.info(f"Extracted {len(df):,} unique molecules ({sample_size} per target)")
+
+        else:
+            # Total sampling: N molecules across all targets (random)
+            target_list = ','.join([f"'{tid}'" for tid in target_ids])
+
+            query = f"""
+            SELECT DISTINCT
+                md.chembl_id,
+                cs.canonical_smiles as smiles
+            FROM compound_structures cs
+            JOIN molecule_dictionary md ON cs.molregno = md.molregno
+            JOIN activities act ON cs.molregno = act.molregno
+            JOIN assays ass ON act.assay_id = ass.assay_id
+            JOIN target_dictionary td ON ass.tid = td.tid
+            WHERE cs.canonical_smiles IS NOT NULL
+                AND act.pchembl_value IS NOT NULL
+                AND td.chembl_id IN ({target_list})
+            """
+
+            if sample_size:
+                query += f" ORDER BY RANDOM() LIMIT {sample_size}"
+
+            df = pd.read_sql_query(query, self.conn)
+            logger.info(f"Extracted {len(df):,} unique molecules (random sample across {len(target_ids)} targets)")
 
         return df
 
@@ -202,7 +263,9 @@ def main():
     parser.add_argument('--specific-targets', nargs='+',
                        help='Extract specific target IDs (e.g., CHEMBL203 CHEMBL217)')
     parser.add_argument('--sample-size', type=int,
-                       help='Limit total molecules extracted (for testing)')
+                       help='Limit molecules extracted (behavior depends on --sample-per-target)')
+    parser.add_argument('--sample-per-target', action='store_true',
+                       help='If set, sample N molecules PER target. Otherwise, sample N total across all targets.')
 
     # MMP extraction parameters
     parser.add_argument('--max-cuts', type=int, default=1,
@@ -211,6 +274,8 @@ def main():
                        help='Maximum MW delta (default: 250)')
     parser.add_argument('--min-similarity', type=float, default=0.35,
                        help='Minimum Tanimoto similarity (default: 0.35)')
+    parser.add_argument('--min-molecules-per-core', type=int, default=10,
+                       help='Minimum molecules per core to keep (default: 10). Lower values = more pairs but higher memory usage.')
 
     # Output options
     parser.add_argument('--output-dir', default='data/pairs',
@@ -223,6 +288,8 @@ def main():
     # Processing options
     parser.add_argument('--skip-extraction', action='store_true',
                        help='Skip database extraction, use cached CSV files')
+    parser.add_argument('--csv-only', action='store_true',
+                       help='Extract only CSV files, skip MMP pair extraction')
 
     args = parser.parse_args()
 
@@ -230,12 +297,26 @@ def main():
     if args.molecules_file and not args.bioactivity_file:
         parser.error("--bioactivity-file required when using --molecules-file")
 
+    if args.csv_only and args.molecules_file:
+        parser.error("--csv-only cannot be used with --molecules-file (CSV files already exist)")
+
+    if args.csv_only and not args.db_path:
+        parser.error("--csv-only requires --db-path")
+
     # Create output directories
+    # Resolve relative paths relative to project root, not current working directory
+    project_root = Path(__file__).parent.parent.parent
     output_dir = Path(args.output_dir)
+    if not output_dir.is_absolute():
+        output_dir = project_root / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.checkpoint_dir:
-        Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = Path(args.checkpoint_dir)
+        if not checkpoint_dir.is_absolute():
+            checkpoint_dir = project_root / checkpoint_dir
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        args.checkpoint_dir = str(checkpoint_dir)  # Update with absolute path
 
     # Generate output filename
     if args.output_name:
@@ -303,9 +384,15 @@ def main():
 
                 # Extract molecules
                 logger.info("Extracting molecules...")
+                if args.sample_per_target and args.sample_size:
+                    logger.info(f"  Sampling {args.sample_size:,} molecules PER target")
+                elif args.sample_size:
+                    logger.info(f"  Sampling {args.sample_size:,} molecules TOTAL (random across all targets)")
+
                 molecules_df = extractor.extract_molecules_for_targets(
                     target_ids=target_ids,
-                    sample_size=args.sample_size
+                    sample_size=args.sample_size,
+                    sample_per_target=args.sample_per_target
                 )
 
                 # Extract bioactivity
@@ -314,12 +401,34 @@ def main():
                     molecule_ids=molecules_df['chembl_id'].tolist()
                 )
 
-            # Save to cache
-            cache_dir = output_dir.parent / 'chembl_cache'
+            # Save to cache with descriptive filenames
+            # Use top-level data directory (project root)
+            project_root = Path(__file__).parent.parent.parent
+            cache_dir = project_root / 'data' / 'small_molecules' / 'chembl'
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-            molecules_file = cache_dir / 'molecules.csv'
-            bioactivity_file = cache_dir / 'bioactivity.csv'
+            # Build filename with hyperparameters
+            filename_parts = []
+
+            # Target selection
+            if args.specific_targets:
+                filename_parts.append(f"targets_{len(args.specific_targets)}")
+            else:
+                filename_parts.append(f"top_targets_{len(target_ids)}")
+
+            # Sampling strategy
+            if args.sample_size:
+                if args.sample_per_target:
+                    filename_parts.append(f"sample_{args.sample_size}_per_target")
+                else:
+                    filename_parts.append(f"sample_{args.sample_size}_total")
+            else:
+                filename_parts.append("all_molecules")
+
+            filename_suffix = "_".join(filename_parts)
+
+            molecules_file = cache_dir / f'molecules_{filename_suffix}.csv'
+            bioactivity_file = cache_dir / f'bioactivity_{filename_suffix}.csv'
 
             molecules_df.to_csv(molecules_file, index=False)
             bioactivity_df.to_csv(bioactivity_file, index=False)
@@ -331,6 +440,25 @@ def main():
         print()
         logger.info(f"✓ Stage 1 complete")
         print()
+
+        # If CSV-only mode, skip MMP extraction
+        if args.csv_only:
+            logger.info("=" * 80)
+            logger.info(" CSV-ONLY MODE: Skipping MMP pair extraction")
+            logger.info("=" * 80)
+            print()
+            logger.info("CSV files saved to:")
+            logger.info(f"  {molecules_file}")
+            logger.info(f"  {bioactivity_file}")
+            print()
+            logger.info("To run MMP pair extraction later:")
+            logger.info(f"  python scripts/extraction/build_pairs_long_format.py \\")
+            logger.info(f"      --molecules-file {molecules_file} \\")
+            logger.info(f"      --bioactivity-file {bioactivity_file} \\")
+            logger.info(f"      --output data/pairs/chembl_pairs.csv \\")
+            logger.info(f"      --max-cuts {args.max_cuts}")
+            print()
+            return 0
 
         # ===== STAGE 2: MMP Pair Extraction =====
         logger.info("=" * 80)
@@ -353,7 +481,8 @@ def main():
             max_mw_delta=args.max_mw_delta,
             min_similarity=args.min_similarity,
             checkpoint_dir=args.checkpoint_dir,
-            resume_from_checkpoint=True
+            resume_from_checkpoint=True,
+            min_molecules_per_core=args.min_molecules_per_core
         )
 
         extraction_time = time.time() - extraction_start

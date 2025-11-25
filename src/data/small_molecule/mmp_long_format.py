@@ -49,6 +49,26 @@ from .mmp_atom_mapping_fast import extract_atom_mapping_fast, serialize_mapping
 logger = logging.getLogger(__name__)
 
 
+def _worker_wrapper_for_imap(args):
+    """
+    Module-level wrapper for multiprocessing.Pool.imap().
+
+    This function is picklable (unlike nested functions) and unpacks
+    arguments to call the static worker method.
+    """
+    chunk_id, chunk, core_index, property_lookup, fragments, max_mw_delta, checkpoint_dir, micro_batch_size = args
+    return LongFormatMMPExtractor._process_core_chunk_worker(
+        chunk_id=chunk_id,
+        chunk=chunk,
+        core_index=core_index,
+        property_lookup=property_lookup,
+        fragments=fragments,
+        max_mw_delta=max_mw_delta,
+        checkpoint_dir=checkpoint_dir,
+        micro_batch_size=micro_batch_size
+    )
+
+
 def get_memory_usage_mb():
     """Get current process memory usage in MB."""
     process = psutil.Process(os.getpid())
@@ -115,7 +135,10 @@ class LongFormatMMPExtractor:
         checkpoint_every: int = 1000,
         resume_from_checkpoint: bool = True,
         micro_batch_size: int = 200,  # NEW: Flush every N pairs
-        property_filter: Optional[set] = None  # NEW: Only extract these properties
+        property_filter: Optional[set] = None,  # NEW: Only extract these properties
+        n_jobs: int = -1,  # NEW: Number of CPU cores for parallelization (-1 = all cores)
+        min_molecules_per_core: int = 10,  # NEW: Minimum molecules per core to keep
+        max_molecules_per_core_sample: int = 1000  # NEW: Sample large cores to this size
     ) -> pd.DataFrame:
         """
         Extract molecular pairs in long format with MEMORY-EFFICIENT streaming.
@@ -130,6 +153,11 @@ class LongFormatMMPExtractor:
             resume_from_checkpoint: Try to resume from checkpoint if exists (default: True)
             micro_batch_size: Flush to disk every N pairs (default: 200)
             property_filter: Optional set of property names to extract (default: None = all)
+            n_jobs: Number of CPU cores for parallelization (default: -1 = all cores, 1 = single-threaded)
+            min_molecules_per_core: Minimum molecules per core to keep (default: 10)
+            max_molecules_per_core_sample: Maximum molecules to sample per core (default: 1000).
+                Cores with more molecules will be randomly sampled to this size to prevent
+                computational explosion. Use None to disable sampling.
 
         Returns:
             Long-format DataFrame with pairs
@@ -177,10 +205,37 @@ class LongFormatMMPExtractor:
         else:
             logger.info("  Computing fragments (this may take a while)...")
             smiles_list = molecules_df['smiles'].tolist()
-            fragments = {}
 
-            for smiles in tqdm(smiles_list, desc="Fragmenting"):
-                frags = self.fragment_molecule(smiles)
+            # Parallelize fragmentation across CPU cores
+            import multiprocessing as mp
+
+            # Determine number of cores to use
+            if n_jobs == -1:
+                n_cores = mp.cpu_count()
+            elif n_jobs <= 0:
+                n_cores = max(1, mp.cpu_count() + n_jobs)
+            else:
+                n_cores = min(n_jobs, mp.cpu_count())
+
+            if n_cores == 1:
+                # Single-threaded mode (useful for debugging)
+                logger.info("  Using single-threaded mode...")
+                results = [self.fragment_molecule(smiles) for smiles in tqdm(smiles_list, desc="Fragmenting")]
+            else:
+                # Multi-threaded mode
+                logger.info(f"  Using {n_cores} CPU cores for parallel fragmentation...")
+
+                # Use multiprocessing pool to fragment in parallel
+                with mp.Pool(processes=n_cores) as pool:
+                    results = list(tqdm(
+                        pool.imap(self.fragment_molecule, smiles_list, chunksize=100),
+                        total=len(smiles_list),
+                        desc="Fragmenting"
+                    ))
+
+            # Build fragments dict from results
+            fragments = {}
+            for smiles, frags in zip(smiles_list, results):
                 if frags:
                     fragments[smiles] = frags
 
@@ -208,8 +263,7 @@ class LongFormatMMPExtractor:
 
         logger.info(f"  ✓ Found {len(core_index):,} total cores")
 
-        # Filter: only keep cores with 10+ molecules for better pair density
-        min_molecules_per_core = 10
+        # Filter: only keep cores with enough molecules for better pair density
         cores_to_keep = {core: mols for core, mols in core_index.items() if len(mols) >= min_molecules_per_core}
 
         num_deleted = len(core_index) - len(cores_to_keep)
@@ -236,166 +290,177 @@ class LongFormatMMPExtractor:
         logger.info(f"  Memory: {mem_after_index:.1f} MB (+{mem_after_index - mem_after_frag:.1f} MB)")
         logger.info("")
 
-        # Step 4: Extract pairs with STREAMING to disk
-        logger.info("Step 4: Extracting pairs (STREAMING MODE)...")
+        # Step 3.5: Sample large cores to prevent computational explosion
+        if max_molecules_per_core_sample:
+            import random
+
+            logger.info(f"Step 3.5: Sampling large cores (max_molecules_per_core_sample={max_molecules_per_core_sample:,})...")
+
+            cores_sampled = 0
+            total_molecules_before = sum(len(core_index[c]) for c in filtered_cores)
+            largest_cores_sampled = []
+
+            for core in filtered_cores:
+                mols = core_index[core]
+                if len(mols) > max_molecules_per_core_sample:
+                    # Deterministic sampling using core hash as seed for reproducibility
+                    random.seed(hash(core))
+                    sampled_mols = random.sample(list(mols), max_molecules_per_core_sample)
+                    core_index[core] = set(sampled_mols)
+                    cores_sampled += 1
+
+                    # Track largest cores for logging
+                    if len(largest_cores_sampled) < 10:
+                        largest_cores_sampled.append((core, len(mols), max_molecules_per_core_sample))
+
+            if cores_sampled > 0:
+                total_molecules_after = sum(len(core_index[c]) for c in filtered_cores)
+                logger.info(f"  ✓ Sampled {cores_sampled:,} large cores")
+                logger.info(f"  ✓ Total molecules in cores: {total_molecules_before:,} → {total_molecules_after:,} ({100*total_molecules_after/total_molecules_before:.1f}%)")
+                logger.info(f"  ✓ Top sampled cores:")
+                for i, (core, orig_size, sampled_size) in enumerate(largest_cores_sampled[:5], 1):
+                    potential_pairs_before = orig_size * (orig_size - 1) // 2
+                    potential_pairs_after = sampled_size * (sampled_size - 1) // 2
+                    logger.info(f"      {i}. {orig_size:,} → {sampled_size:,} molecules ({potential_pairs_before:,} → {potential_pairs_after:,} potential pairs)")
+            else:
+                logger.info(f"  ✓ No cores exceeded {max_molecules_per_core_sample:,} molecules - no sampling needed")
+            logger.info("")
+
+        # Step 4: Extract pairs with PARALLEL PROCESSING
+        logger.info("Step 4: Extracting pairs (PARALLEL MODE)...")
 
         # Setup checkpoint directory
         if checkpoint_dir:
             checkpoint_path = Path(checkpoint_dir)
             checkpoint_path.mkdir(parents=True, exist_ok=True)
-            checkpoint_file = checkpoint_path / "pairs_checkpoint.csv"
         else:
-            checkpoint_file = None
+            # Create temporary directory for parallel processing
+            import tempfile
+            checkpoint_path = Path(tempfile.mkdtemp(prefix="mmp_parallel_"))
+            logger.info(f"  Created temporary checkpoint dir: {checkpoint_path}")
 
-        # Count existing pairs
-        total_pairs_written = 0
-        if resume_from_checkpoint and checkpoint_file and checkpoint_file.exists():
-            logger.info("  Found checkpoint, resuming...")
-            import subprocess
-            try:
-                result = subprocess.run(['wc', '-l', str(checkpoint_file)],
-                                      capture_output=True, text=True, check=True)
-                line_count = int(result.stdout.split()[0])
-                total_pairs_written = max(0, line_count - 1)
-                logger.info(f"  Existing checkpoint has {total_pairs_written:,} pairs")
-            except:
-                with open(checkpoint_file, 'r') as f:
-                    total_pairs_written = sum(1 for _ in f) - 1
-                logger.info(f"  Existing checkpoint has {total_pairs_written:,} pairs")
-
-        # Open file handle for streaming writes
-        file_handle = None
-        if checkpoint_file:
-            mode = 'a' if (resume_from_checkpoint and checkpoint_file.exists()) else 'w'
-            file_handle = open(checkpoint_file, mode, buffering=1024*1024)
-
-            if mode == 'w':
-                file_handle.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,delta,target_name,target_chembl_id,doc_id_a,doc_id_b,assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,attach_atoms_A,mapped_pairs\n")
-
-        logger.info(f"  Total cores to process: {len(filtered_cores):,}")
-        logger.info(f"  Flushing to disk every {micro_batch_size} pairs")
+        # Create balanced chunks
+        logger.info(f"  Creating balanced chunks (target: 500 molecules per chunk)...")
+        chunks = self._create_balanced_core_chunks(
+            core_index=core_index,
+            target_molecules_per_chunk=500
+        )
+        logger.info(f"  ✓ Created {len(chunks)} chunks")
         logger.info("")
 
-        # Micro-batch for memory efficiency
-        batch_pairs = []
-        all_pairs = []  # NEW: When no checkpoint, accumulate all pairs in memory
+        # Check chunk progress (for resume support)
+        incomplete_chunks, completed_files = self._check_chunk_progress(
+            chunks=chunks,
+            checkpoint_dir=str(checkpoint_path)
+        )
+
+        if completed_files:
+            logger.info(f"  ✓ Found {len(completed_files)} completed chunks (resuming)")
+
+        logger.info(f"  ✓ {len(incomplete_chunks)} chunks to process")
+        logger.info("")
+
+        # Determine number of workers
+        import multiprocessing as mp
+        if n_jobs == -1:
+            num_workers = mp.cpu_count()
+        elif n_jobs < -1:
+            num_workers = max(1, mp.cpu_count() + n_jobs + 1)
+        else:
+            num_workers = max(1, n_jobs)
+
+        logger.info(f"  Using {num_workers} parallel workers")
+        logger.info(f"  Micro-batch size: {micro_batch_size} pairs")
+        logger.info("")
+
+        # Create property lookup by chembl_id (not SMILES) for workers
+        # Keep full structure: {chembl_id: {'chembl_id': ..., 'properties': {...}}}
+        property_lookup_by_id = {}
+        for smiles, data in property_lookup.items():
+            chembl_id = data['chembl_id']
+            property_lookup_by_id[chembl_id] = data
+
+        # Create fragments lookup by chembl_id
+        fragments_by_id = {}
+        for smiles, frags in fragments.items():
+            chembl_id = property_lookup[smiles]['chembl_id']
+            fragments_by_id[chembl_id] = frags
+
+        # Convert core_index from SMILES to chembl_id
+        core_index_by_id = {}
+        for core, smiles_list in core_index.items():
+            chembl_ids = [property_lookup[s]['chembl_id'] for s in smiles_list if s in property_lookup]
+            if chembl_ids:
+                core_index_by_id[core] = chembl_ids
+
         mem_peak = mem_after_index
 
-        # DEBUG: Add counters for diagnostics
-        debug_counts = {
-            'checked': 0,
-            'no_lookup': 0,
-            'no_mw': 0,
-            'mw_filter': 0,
-            'extracted_called': 0,
-            'pairs_found': 0
-        }
+        # Process chunks in parallel
+        if num_workers == 1 or len(incomplete_chunks) == 1:
+            # Single-threaded mode (for debugging)
+            logger.info("  Running in single-threaded mode...")
+            worker_files = []
+            for chunk_id, chunk in incomplete_chunks:
+                output_file = self._process_core_chunk_worker(
+                    chunk_id=chunk_id,
+                    chunk=chunk,
+                    core_index=core_index_by_id,
+                    property_lookup=property_lookup_by_id,
+                    fragments=fragments_by_id,
+                    max_mw_delta=max_mw_delta,
+                    checkpoint_dir=str(checkpoint_path),
+                    micro_batch_size=micro_batch_size
+                )
+                worker_files.append(output_file)
+        else:
+            # Multi-process mode
+            logger.info("  Starting parallel processing...")
+            worker_files = []
 
-        # Iterate over cores
-        core_pbar = tqdm(filtered_cores, desc="Cores", position=0)
+            # Prepare arguments for imap (each element is a tuple of arguments)
+            worker_args = [
+                (
+                    chunk_id,
+                    chunk,
+                    core_index_by_id,
+                    property_lookup_by_id,
+                    fragments_by_id,
+                    max_mw_delta,
+                    str(checkpoint_path),
+                    micro_batch_size
+                )
+                for chunk_id, chunk in incomplete_chunks
+            ]
 
-        for core in core_pbar:
-            smiles_list = core_index[core]
+            with mp.Pool(processes=num_workers) as pool:
+                # Use imap with module-level wrapper for real-time progress
+                results = list(tqdm(
+                    pool.imap(_worker_wrapper_for_imap, worker_args, chunksize=1),
+                    total=len(worker_args),
+                    desc="Processing chunks"
+                ))
+                worker_files.extend(results)
 
-            # Calculate total pairs for this core
-            n_molecules = len(smiles_list)
-            total_pairs_in_core = n_molecules * (n_molecules - 1) // 2
+        # Add completed files
+        worker_files.extend(completed_files)
 
-            # Update core progress bar
-            core_pbar.set_postfix({
-                'core_size': n_molecules,
-                'pairs': total_pairs_in_core,
-                'written': total_pairs_written
-            })
+        logger.info(f"  ✓ All chunks complete!")
+        logger.info("")
 
-            # Nested progress bar for pairs within this core
-            pair_pbar = tqdm(total=total_pairs_in_core, desc=f"  Pairs (core size={n_molecules})",
-                           position=1, leave=False)
+        # Merge worker files
+        final_output = checkpoint_path / "pairs_final.csv"
+        self._merge_worker_files(worker_files=worker_files, final_output=final_output)
 
-            # Process all pairs within this core
-            for i in range(len(smiles_list)):
-                for j in range(i + 1, len(smiles_list)):
-                    pair_pbar.update(1)
-                    smiles_a = smiles_list[i]
-                    smiles_b = smiles_list[j]
-
-                    debug_counts['checked'] += 1
-
-                    # Check MW filter
-                    if smiles_a not in property_lookup or smiles_b not in property_lookup:
-                        debug_counts['no_lookup'] += 1
-                        continue
-
-                    mw_a = property_lookup[smiles_a]['properties'].get('mw')
-                    mw_b = property_lookup[smiles_b]['properties'].get('mw')
-
-                    if mw_a is None or mw_b is None:
-                        debug_counts['no_mw'] += 1
-                        continue
-
-                    if abs(mw_a - mw_b) > max_mw_delta:
-                        debug_counts['mw_filter'] += 1
-                        continue
-
-                    # Extract pair
-                    debug_counts['extracted_called'] += 1
-                    pair_data = self._extract_single_pair(
-                        smiles_a, smiles_b,
-                        fragments[smiles_a], fragments[smiles_b],
-                        property_lookup,
-                        property_filter
-                    )
-
-                    if pair_data:
-                        debug_counts['pairs_found'] += len(pair_data)
-
-                    if pair_data:
-                        batch_pairs.extend(pair_data)
-
-                    # MICRO-BATCH FLUSH
-                    if len(batch_pairs) >= micro_batch_size:
-                        if file_handle:
-                            for row in batch_pairs:
-                                file_handle.write(
-                                    f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
-                                    f"{row['property_name']},{row['value_a']},{row['value_b']},"
-                                    f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
-                                    f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']},"
-                                    f"{row['removed_atoms_A']},{row['added_atoms_B']},{row['attach_atoms_A']},{row['mapped_pairs']}\n"
-                                )
-                            file_handle.flush()
-                        else:
-                            # No checkpoint file - accumulate in memory
-                            all_pairs.extend(batch_pairs)
-
-                        total_pairs_written += len(batch_pairs)
-                        batch_pairs = []
-                        gc.collect()
-
-        core_pbar.close()
-
-        # Write final batch
-        if batch_pairs:
-            if file_handle:
-                for row in batch_pairs:
-                    file_handle.write(
-                        f"{row['mol_a']},{row['mol_b']},{row['edit_smiles']},{row['num_cuts']},"
-                        f"{row['property_name']},{row['value_a']},{row['value_b']},"
-                        f"{row['delta']},{row['target_name']},{row['target_chembl_id']},"
-                        f"{row['doc_id_a']},{row['doc_id_b']},{row['assay_id_a']},{row['assay_id_b']},"
-                        f"{row['removed_atoms_A']},{row['added_atoms_B']},{row['attach_atoms_A']},{row['mapped_pairs']}\n"
-                    )
-                file_handle.flush()
-            else:
-                # No checkpoint file - accumulate in memory
-                all_pairs.extend(batch_pairs)
-
-            total_pairs_written += len(batch_pairs)
-            batch_pairs = []
-
-        # Close file handle
-        if file_handle:
-            file_handle.close()
+        # Count total pairs
+        import subprocess
+        try:
+            result = subprocess.run(['wc', '-l', str(final_output)],
+                                  capture_output=True, text=True, check=True)
+            line_count = int(result.stdout.split()[0])
+            total_pairs_written = max(0, line_count - 1)
+        except:
+            with open(final_output, 'r') as f:
+                total_pairs_written = sum(1 for _ in f) - 1
 
         logger.info(f"  ✓ Extracted {total_pairs_written:,} pair-property combinations")
         mem_after_extraction = get_memory_usage_mb()
@@ -403,37 +468,16 @@ class LongFormatMMPExtractor:
         logger.info(f"  Peak memory during extraction: {mem_peak:.1f} MB")
         logger.info("")
 
-        # DEBUG: Print diagnostic counts
-        logger.info("  DEBUG: Pair extraction diagnostics:")
-        logger.info(f"    Pairs checked: {debug_counts['checked']:,}")
-        logger.info(f"    Filtered (no lookup): {debug_counts['no_lookup']:,}")
-        logger.info(f"    Filtered (no MW): {debug_counts['no_mw']:,}")
-        logger.info(f"    Filtered (MW delta): {debug_counts['mw_filter']:,}")
-        logger.info(f"    _extract_single_pair called: {debug_counts['extracted_called']:,}")
-        logger.info(f"    Pairs found: {debug_counts['pairs_found']:,}")
+        # Read final result
+        logger.info("  Reading final result from disk...")
+        df_pairs_long = pd.read_csv(final_output)
+
+        # Clean up if using temporary directory
+        if not checkpoint_dir:
+            import shutil
+            shutil.rmtree(checkpoint_path)
+            logger.info(f"  Cleaned up temporary directory")
         logger.info("")
-
-        # Read final result from checkpoint (in chunks to avoid memory spike)
-        if checkpoint_file and checkpoint_file.exists():
-            logger.info("  Reading final result from disk...")
-            df_pairs_long = pd.read_csv(checkpoint_file)
-
-            # Clean up checkpoint on success
-            checkpoint_file.unlink()
-            logger.info("  Cleaned up checkpoint file")
-            logger.info("")
-        else:
-            # No checkpoint file - convert from memory-accumulated pairs
-            if all_pairs:
-                logger.info("  Converting accumulated pairs to DataFrame...")
-                df_pairs_long = pd.DataFrame(all_pairs)
-                logger.info("")
-            else:
-                df_pairs_long = pd.DataFrame(columns=[
-                    'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name', 'value_a', 'value_b',
-                    'delta', 'target_name', 'target_chembl_id', 'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b',
-                    'removed_atoms_A', 'added_atoms_B', 'attach_atoms_A', 'mapped_pairs'
-                ])
 
         if len(df_pairs_long) == 0:
             logger.warning("  No pairs found!")
@@ -746,6 +790,357 @@ class LongFormatMMPExtractor:
             rows.append(row)
 
         return rows
+
+    def _create_balanced_core_chunks(
+        self,
+        core_index: Dict[str, List[str]],
+        target_molecules_per_chunk: int = 500
+    ) -> List[Dict]:
+        """
+        Create balanced chunks where each chunk has ~target_molecules_per_chunk molecules.
+
+        This ensures balanced workload across workers, regardless of core size distribution.
+
+        Args:
+            core_index: Dict mapping core SMILES to list of molecule SMILES
+            target_molecules_per_chunk: Target number of molecules per chunk (default: 500)
+
+        Returns:
+            List of chunk dicts with 'cores' and 'molecule_count' keys
+        """
+        chunks = []
+        current_chunk_cores = []
+        current_molecule_count = 0
+
+        # Sort cores by size (largest first) for better load balancing
+        sorted_cores = sorted(core_index.keys(), key=lambda c: len(core_index[c]), reverse=True)
+
+        for core in sorted_cores:
+            core_molecules = len(core_index[core])
+
+            # If adding this core exceeds target, start new chunk
+            # (unless current chunk is empty - avoid tiny cores getting their own chunk)
+            if current_molecule_count + core_molecules > target_molecules_per_chunk and current_chunk_cores:
+                chunks.append({
+                    'cores': current_chunk_cores,
+                    'molecule_count': current_molecule_count
+                })
+                current_chunk_cores = []
+                current_molecule_count = 0
+
+            current_chunk_cores.append(core)
+            current_molecule_count += core_molecules
+
+        # Add final chunk
+        if current_chunk_cores:
+            chunks.append({
+                'cores': current_chunk_cores,
+                'molecule_count': current_molecule_count
+            })
+
+        return chunks
+
+    @staticmethod
+    def _check_chunk_progress(chunks: List[Dict], checkpoint_dir: Optional[str]) -> Tuple[List[Tuple], List[str]]:
+        """
+        Check which chunks are already complete (for resume support).
+
+        Args:
+            chunks: List of chunk dicts
+            checkpoint_dir: Checkpoint directory path
+
+        Returns:
+            Tuple of (incomplete_chunks, completed_files)
+            - incomplete_chunks: List of (chunk_id, chunk_dict) tuples to process
+            - completed_files: List of paths to completed worker files
+        """
+        if not checkpoint_dir:
+            # No checkpointing, process all chunks
+            return [(i, chunk) for i, chunk in enumerate(chunks)], []
+
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.exists():
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+        incomplete_chunks = []
+        completed_files = []
+
+        for i, chunk in enumerate(chunks):
+            checkpoint_file = checkpoint_path / f"checkpoint_chunk_{i}.pkl"
+            output_file = checkpoint_path / f"pairs_chunk_{i}.csv"
+
+            if checkpoint_file.exists() and output_file.exists():
+                try:
+                    import pickle
+                    with open(checkpoint_file, 'rb') as f:
+                        state = pickle.load(f)
+                        if state.get('completed', False):
+                            logger.info(f"  Chunk {i} already complete ({state.get('pairs_written', 0):,} pairs)")
+                            completed_files.append(str(output_file))
+                            continue
+                except Exception as e:
+                    logger.warning(f"  Failed to load checkpoint for chunk {i}: {e}")
+
+            incomplete_chunks.append((i, chunk))
+
+        return incomplete_chunks, completed_files
+
+    @staticmethod
+    def _merge_worker_files(worker_files: List[str], final_output: Path) -> None:
+        """
+        Merge worker output files into final CSV.
+
+        Args:
+            worker_files: List of paths to worker CSV files
+            final_output: Path to final merged CSV file
+        """
+        logger.info(f"Merging {len(worker_files)} worker files...")
+
+        with open(final_output, 'w', buffering=1024*1024) as out:
+            # Write header
+            out.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,"
+                     "delta,target_name,target_chembl_id,doc_id_a,doc_id_b,"
+                     "assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,"
+                     "attach_atoms_A,mapped_pairs\n")
+
+            # Concatenate worker files
+            for worker_file in tqdm(worker_files, desc="Merging"):
+                if not Path(worker_file).exists():
+                    logger.warning(f"Worker file not found: {worker_file}")
+                    continue
+
+                with open(worker_file, 'r') as f:
+                    # Skip header if it exists
+                    first_line = f.readline()
+                    if not first_line.startswith('mol_a,'):
+                        # Not a header, write it
+                        out.write(first_line)
+                    # Write rest of file
+                    out.write(f.read())
+
+        logger.info(f"✓ Merged to {final_output}")
+
+    @staticmethod
+    def _process_core_chunk_worker(
+        chunk_id: int,
+        chunk: Dict,
+        core_index: Dict[str, List[str]],
+        property_lookup: Dict,
+        fragments: Dict,
+        max_mw_delta: float,
+        checkpoint_dir: str,
+        micro_batch_size: int = 1000
+    ) -> str:
+        """
+        Process a chunk of cores and extract all pairs.
+
+        This is the worker function that runs in parallel.
+        Each worker processes its assigned cores and writes to its own file.
+
+        Args:
+            chunk_id: Unique ID for this chunk
+            chunk: Dict with 'cores' and 'molecule_count'
+            core_index: Full core index mapping (chembl_id-based)
+            property_lookup: Property lookup table (chembl_id-based)
+            fragments: Fragment lookup table (chembl_id-based)
+            max_mw_delta: Max MW difference filter
+            checkpoint_dir: Directory for checkpoints and output
+            micro_batch_size: Flush to disk every N pairs (default: 1000)
+
+        Returns:
+            Path to worker output file
+        """
+        import pickle
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors
+
+        checkpoint_path = Path(checkpoint_dir)
+        output_file = checkpoint_path / f"pairs_chunk_{chunk_id}.csv"
+        checkpoint_file = checkpoint_path / f"checkpoint_chunk_{chunk_id}.pkl"
+
+        # Print start message (commented out to reduce output)
+        # print(f"[Chunk {chunk_id}] Starting: {len(chunk['cores'])} cores, ~{chunk['molecule_count']} molecules", flush=True)
+
+        # Extract MW from property_lookup for fast filtering
+        mw_lookup = {}
+        for chembl_id, data in property_lookup.items():
+            mw = data['properties'].get('mw')
+            if mw is not None:
+                mw_lookup[chembl_id] = mw
+
+        # Open output file
+        pair_buffer = []
+        pairs_written = 0
+        cores_processed = 0
+
+        with open(output_file, 'w', buffering=1024*1024) as f:
+            # Write header
+            f.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,"
+                   "delta,target_name,target_chembl_id,doc_id_a,doc_id_b,"
+                   "assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,"
+                   "attach_atoms_A,mapped_pairs\n")
+
+            # Process each core in the chunk
+            total_cores = len(chunk['cores'])
+            for core_idx, core in enumerate(chunk['cores']):
+                chembl_ids = core_index[core]
+
+                # Skip small cores
+                if len(chembl_ids) < 2:
+                    continue
+
+                # Log progress every 10% of cores (commented out to reduce output)
+                # if core_idx % max(1, total_cores // 10) == 0:
+                #     progress_pct = (core_idx / total_cores) * 100
+                #     print(f"[Chunk {chunk_id}] Progress: {progress_pct:.0f}% ({core_idx}/{total_cores} cores, {pairs_written} pairs written)", flush=True)
+
+                # Extract all pairs from this core
+                for i in range(len(chembl_ids)):
+                    for j in range(i + 1, len(chembl_ids)):
+                        chembl_id_a = chembl_ids[i]
+                        chembl_id_b = chembl_ids[j]
+
+                        # MW filter
+                        mw_a = mw_lookup.get(chembl_id_a)
+                        mw_b = mw_lookup.get(chembl_id_b)
+                        if mw_a is None or mw_b is None:
+                            continue
+                        if abs(mw_a - mw_b) > max_mw_delta:
+                            continue
+
+                        # Get properties for both molecules
+                        data_a = property_lookup.get(chembl_id_a, {})
+                        data_b = property_lookup.get(chembl_id_b, {})
+
+                        props_a = data_a.get('properties', {})
+                        props_b = data_b.get('properties', {})
+
+                        # Find common properties
+                        common_properties = set(props_a.keys()) & set(props_b.keys())
+
+                        if not common_properties:
+                            continue
+
+                        # Get fragments for this core
+                        frags_a = fragments.get(chembl_id_a, {})
+                        frags_b = fragments.get(chembl_id_b, {})
+
+                        # Check if both molecules have this core
+                        if core not in frags_a or core not in frags_b:
+                            continue
+
+                        chains_a = frags_a[core]
+                        chains_b = frags_b[core]
+
+                        # Extract pair for each common property
+                        for prop_name in common_properties:
+                            # Get property values
+                            prop_a = props_a[prop_name]
+                            prop_b = props_b[prop_name]
+
+                            # Handle both dict (bioactivity) and scalar (computed) properties
+                            if isinstance(prop_a, dict):
+                                value_a = prop_a['value']
+                                target_name = prop_a.get('target_name', '')
+                                target_chembl_id = prop_a.get('target_chembl_id', '')
+                                doc_id_a = prop_a.get('doc_id', '')
+                                assay_id_a = prop_a.get('assay_id', '')
+                            else:
+                                value_a = prop_a
+                                target_name = ''
+                                target_chembl_id = ''
+                                doc_id_a = ''
+                                assay_id_a = ''
+
+                            if isinstance(prop_b, dict):
+                                value_b = prop_b['value']
+                                doc_id_b = prop_b.get('doc_id', '')
+                                assay_id_b = prop_b.get('assay_id', '')
+                            else:
+                                value_b = prop_b
+                                doc_id_b = ''
+                                assay_id_b = ''
+
+                            # Calculate delta
+                            try:
+                                delta = float(value_b) - float(value_a)
+                            except (ValueError, TypeError):
+                                delta = None
+
+                            # Create edit SMILES (just use chains_b for now - simplified)
+                            edit_smiles = chains_b
+
+                            # Count cuts (number of attachment points in chains)
+                            num_cuts = chains_a.count('[*:')
+
+                            # Create row
+                            row = {
+                                'mol_a': chembl_id_a,
+                                'mol_b': chembl_id_b,
+                                'edit_smiles': edit_smiles,
+                                'num_cuts': num_cuts,
+                                'property_name': prop_name,
+                                'value_a': value_a,
+                                'value_b': value_b,
+                                'delta': delta,
+                                'target_name': target_name,
+                                'target_chembl_id': target_chembl_id,
+                                'doc_id_a': doc_id_a,
+                                'doc_id_b': doc_id_b,
+                                'assay_id_a': assay_id_a,
+                                'assay_id_b': assay_id_b,
+                                'removed_atoms_A': '',  # Simplified - not computing atom mapping in parallel
+                                'added_atoms_B': '',
+                                'attach_atoms_A': '',
+                                'mapped_pairs': ''
+                            }
+
+                            pair_buffer.append(row)
+                            pairs_written += 1
+
+                            # Flush buffer if needed
+                            if len(pair_buffer) >= micro_batch_size:
+                                for pair in pair_buffer:
+                                    f.write(f"{pair['mol_a']},{pair['mol_b']},{pair['edit_smiles']},"
+                                           f"{pair['num_cuts']},{pair['property_name']},{pair['value_a']},"
+                                           f"{pair['value_b']},{pair['delta']},{pair['target_name']},"
+                                           f"{pair['target_chembl_id']},{pair['doc_id_a']},{pair['doc_id_b']},"
+                                           f"{pair['assay_id_a']},{pair['assay_id_b']},{pair['removed_atoms_A']},"
+                                           f"{pair['added_atoms_B']},{pair['attach_atoms_A']},{pair['mapped_pairs']}\n")
+                                pair_buffer = []
+
+                                # Save checkpoint
+                                with open(checkpoint_file, 'wb') as cp:
+                                    pickle.dump({
+                                        'chunk_id': chunk_id,
+                                        'pairs_written': pairs_written,
+                                        'cores_processed': cores_processed,
+                                        'completed': False
+                                    }, cp)
+
+                cores_processed += 1
+
+            # Flush remaining pairs
+            if pair_buffer:
+                for pair in pair_buffer:
+                    f.write(f"{pair['mol_a']},{pair['mol_b']},{pair['edit_smiles']},"
+                           f"{pair['num_cuts']},{pair['property_name']},{pair['value_a']},"
+                           f"{pair['value_b']},{pair['delta']},{pair['target_name']},"
+                           f"{pair['target_chembl_id']},{pair['doc_id_a']},{pair['doc_id_b']},"
+                           f"{pair['assay_id_a']},{pair['assay_id_b']},{pair['removed_atoms_A']},"
+                           f"{pair['added_atoms_B']},{pair['attach_atoms_A']},{pair['mapped_pairs']}\n")
+
+        # Mark as complete
+        with open(checkpoint_file, 'wb') as cp:
+            pickle.dump({
+                'chunk_id': chunk_id,
+                'pairs_written': pairs_written,
+                'cores_processed': cores_processed,
+                'completed': True
+            }, cp)
+
+        # print(f"[Chunk {chunk_id}] Complete: {pairs_written} pairs written from {cores_processed} cores", flush=True)
+        return str(output_file)
 
 
 def main():

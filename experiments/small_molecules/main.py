@@ -8,9 +8,9 @@ from run_experiment import run_experiment
 
 
 def main():
-    # Splitters to run ( need to optimize 'butina')
-    splitters = ['random', 'scaffold', 'stratified', 'target']
-
+    # Splitters to run (need to optimize 'butina')
+    splitters = ['random', 'scaffold', 'target', 'few_shot_target']
+    #splitters = ['core']
     for splitter_type in splitters:
         print(f"\n{'='*80}")
         print(f"Running experiment with {splitter_type.upper()} split")
@@ -22,6 +22,16 @@ def main():
             splitter_params[splitter_type] = {'target_col': 'target_chembl_id'}
         elif splitter_type == 'stratified':
             splitter_params[splitter_type] = {'property_col': 'delta'}
+        elif splitter_type == 'few_shot_target':
+            # Few-shot learning: 30% of targets with only 100 training examples each
+            splitter_params[splitter_type] = {
+                'target_col': 'target_chembl_id',
+                'few_shot_target_fraction': 0.3,
+                'few_shot_samples': 100  # Can also try 1000
+            }
+        elif splitter_type == 'core':
+            # Core-based split: ensure unique cores in val/test
+            splitter_params[splitter_type] = {'core_col': 'core'}
 
         config = ExperimentConfig(
             experiment_name=f"small_molecule_edit_prediction_{splitter_type}",
@@ -36,6 +46,8 @@ def main():
             random_seed=42,
 
             num_tasks=10,
+            min_pairs_per_property=0,  # Minimum number of pairs required per property
+            min_properties_per_edit=2,  # Minimum number of properties an edit must appear in
 
             methods=[
                 {
@@ -47,7 +59,7 @@ def main():
                     'lr': 0.001,  # Learning rate for MLP heads
                     'gnn_lr': 1e-5,  # Learning rate for GNN (if trainable)
                     'batch_size': 128,
-                    'max_epochs': 10
+                    'max_epochs': 2
                 },
                 {
                     'name': 'Edit Framework - ChemProp with Fragments',
@@ -58,7 +70,7 @@ def main():
                     'lr': 0.001,  # Learning rate for MLP heads
                     'gnn_lr': 1e-5,  # Learning rate for GNN (if trainable)
                     'batch_size': 128,
-                    'max_epochs': 10
+                    'max_epochs': 2
                 },
                 {
                     'name': 'Baseline Property Predictor',
@@ -67,7 +79,7 @@ def main():
                     'dropout': 0.1,
                     'lr': 0.001,
                     'batch_size': 128,
-                    'max_epochs': 10
+                    'max_epochs': 2
                 }
             ],
 

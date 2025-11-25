@@ -19,6 +19,7 @@ class ExperimentConfig:
 
     # Optional parameters with defaults
     min_pairs_per_property: int = 0
+    min_properties_per_edit: int = 1  # Minimum number of properties an edit must appear in
     splitter_params: Dict = field(default_factory=dict)
     test_datasets: List[str] = field(default_factory=list)
     save_models: bool = False
