@@ -56,7 +56,7 @@ def _worker_wrapper_for_imap(args):
     This function is picklable (unlike nested functions) and unpacks
     arguments to call the static worker method.
     """
-    chunk_id, chunk, core_index, property_lookup, fragments, max_mw_delta, checkpoint_dir, micro_batch_size = args
+    chunk_id, chunk, core_index, property_lookup, fragments, max_mw_delta, checkpoint_dir, micro_batch_size, property_filter = args
     return LongFormatMMPExtractor._process_core_chunk_worker(
         chunk_id=chunk_id,
         chunk=chunk,
@@ -65,7 +65,8 @@ def _worker_wrapper_for_imap(args):
         fragments=fragments,
         max_mw_delta=max_mw_delta,
         checkpoint_dir=checkpoint_dir,
-        micro_batch_size=micro_batch_size
+        micro_batch_size=micro_batch_size,
+        property_filter=property_filter
     )
 
 
@@ -409,7 +410,8 @@ class LongFormatMMPExtractor:
                     fragments=fragments_by_id,
                     max_mw_delta=max_mw_delta,
                     checkpoint_dir=str(checkpoint_path),
-                    micro_batch_size=micro_batch_size
+                    micro_batch_size=micro_batch_size,
+                    property_filter=property_filter
                 )
                 worker_files.append(output_file)
         else:
@@ -427,7 +429,8 @@ class LongFormatMMPExtractor:
                     fragments_by_id,
                     max_mw_delta,
                     str(checkpoint_path),
-                    micro_batch_size
+                    micro_batch_size,
+                    property_filter
                 )
                 for chunk_id, chunk in incomplete_chunks
             ]
@@ -554,7 +557,8 @@ class LongFormatMMPExtractor:
                     pass  # Skip if MW computation fails
 
         # Bioactivity properties (with target info)
-        # Use vectorized operations instead of iterrows for better performance
+        # IMPORTANT: Use composite key (property_name, target_chembl_id) to preserve
+        # multiple measurements per molecule across different targets
         for _, row in bioactivity_df.iterrows():
             chembl_id = row['chembl_id']
 
@@ -564,17 +568,22 @@ class LongFormatMMPExtractor:
                 continue
 
             prop_name = row['property_name']
-            # Support both pchembl_value and standard_value
-            value = row.get('pchembl_value') or row.get('standard_value')
+            # Get value from 'value' column (long format has this column)
+            # Also support 'pchembl_value' and 'standard_value' for backwards compatibility
+            value = row.get('value') or row.get('pchembl_value') or row.get('standard_value')
             target_name = row.get('target_name', '')
             target_chembl_id = row.get('target_chembl_id', '')
             doc_id = row.get('doc_id')
             assay_id = row.get('assay_id')
 
             if pd.notna(value):
-                # Store value, target info, and batch tracking fields
-                lookup[smiles]['properties'][prop_name] = {
+                # Use composite key: (property_name, target_chembl_id)
+                # This preserves ALL measurements (same molecule tested on multiple targets)
+                composite_key = f"{prop_name}@{target_chembl_id}"
+
+                lookup[smiles]['properties'][composite_key] = {
                     'value': value,
+                    'property_name': prop_name,  # Store original property name
                     'target_name': target_name,
                     'target_chembl_id': target_chembl_id,
                     'doc_id': doc_id if pd.notna(doc_id) else None,
@@ -584,6 +593,14 @@ class LongFormatMMPExtractor:
         # DEBUG: Check how many molecules have MW computed
         molecules_with_mw = sum(1 for data in lookup.values() if 'mw' in data['properties'])
         logger.info(f"  MW computed for {molecules_with_mw}/{len(lookup)} molecules")
+
+        # Count bioactivity measurements (composite keys)
+        total_measurements = sum(
+            1 for data in lookup.values()
+            for key in data['properties'].keys()
+            if '@' in str(key)  # Composite keys have '@'
+        )
+        logger.info(f"  Bioactivity: {total_measurements} measurements across {len(lookup)} molecules")
 
         return lookup
 
@@ -723,27 +740,30 @@ class LongFormatMMPExtractor:
         # Create one row per property
         rows = []
 
-        for prop_name in shared_props:
-            # Skip if property not in filter
-            if property_filter and prop_name not in property_filter:
-                continue
-
-            value_a_raw = props_a[prop_name]
-            value_b_raw = props_b[prop_name]
+        for composite_key in shared_props:
+            value_a_raw = props_a[composite_key]
+            value_b_raw = props_b[composite_key]
 
             # Extract value and target info if dict (bioactivity), else just use value (computed prop)
             if isinstance(value_a_raw, dict):
                 value_a = value_a_raw['value']
+                # Extract original property_name from dict (for composite keys)
+                property_name = value_a_raw.get('property_name', composite_key)
                 target_name = value_a_raw.get('target_name', '')
                 target_chembl_id = value_a_raw.get('target_chembl_id', '')
                 doc_id_a = value_a_raw.get('doc_id')
                 assay_id_a = value_a_raw.get('assay_id')
             else:
                 value_a = value_a_raw
+                property_name = composite_key  # Computed properties use simple keys
                 target_name = ''
                 target_chembl_id = ''
                 doc_id_a = None
                 assay_id_a = None
+
+            # Skip if property not in filter (check AFTER extracting property_name)
+            if property_filter and property_name not in property_filter:
+                continue
 
             if isinstance(value_b_raw, dict):
                 value_b = value_b_raw['value']
@@ -770,7 +790,7 @@ class LongFormatMMPExtractor:
                 'mol_b': smiles_b,
                 'edit_smiles': edit_smiles,  # ⭐ CANONICAL: "C>>CC" for ChemBERTa encoding
                 'num_cuts': num_cuts,  # Number of bond cuts (1, 2, or 3)
-                'property_name': prop_name,
+                'property_name': property_name,  # Use extracted property_name, not composite_key
                 'value_a': value_a,
                 'value_b': value_b,
                 'delta': delta,
@@ -929,7 +949,8 @@ class LongFormatMMPExtractor:
         fragments: Dict,
         max_mw_delta: float,
         checkpoint_dir: str,
-        micro_batch_size: int = 1000
+        micro_batch_size: int = 1000,
+        property_filter: Optional[set] = None
     ) -> str:
         """
         Process a chunk of cores and extract all pairs.
@@ -946,6 +967,7 @@ class LongFormatMMPExtractor:
             max_mw_delta: Max MW difference filter
             checkpoint_dir: Directory for checkpoints and output
             micro_batch_size: Flush to disk every N pairs (default: 1000)
+            property_filter: Optional set of property names to include (default: None = all)
 
         Returns:
             Path to worker output file
@@ -1033,24 +1055,31 @@ class LongFormatMMPExtractor:
                         chains_b = frags_b[core]
 
                         # Extract pair for each common property
-                        for prop_name in common_properties:
+                        for composite_key in common_properties:
                             # Get property values
-                            prop_a = props_a[prop_name]
-                            prop_b = props_b[prop_name]
+                            prop_a = props_a[composite_key]
+                            prop_b = props_b[composite_key]
 
                             # Handle both dict (bioactivity) and scalar (computed) properties
                             if isinstance(prop_a, dict):
                                 value_a = prop_a['value']
+                                # Extract original property_name from dict (for composite keys)
+                                property_name = prop_a.get('property_name', composite_key)
                                 target_name = prop_a.get('target_name', '')
                                 target_chembl_id = prop_a.get('target_chembl_id', '')
                                 doc_id_a = prop_a.get('doc_id', '')
                                 assay_id_a = prop_a.get('assay_id', '')
                             else:
                                 value_a = prop_a
+                                property_name = composite_key  # Computed properties use simple keys
                                 target_name = ''
                                 target_chembl_id = ''
                                 doc_id_a = ''
                                 assay_id_a = ''
+
+                            # Skip if property not in filter (check AFTER extracting property_name)
+                            if property_filter and property_name not in property_filter:
+                                continue
 
                             if isinstance(prop_b, dict):
                                 value_b = prop_b['value']
@@ -1079,7 +1108,7 @@ class LongFormatMMPExtractor:
                                 'mol_b': chembl_id_b,
                                 'edit_smiles': edit_smiles,
                                 'num_cuts': num_cuts,
-                                'property_name': prop_name,
+                                'property_name': property_name,  # Use extracted property_name
                                 'value_a': value_a,
                                 'value_b': value_b,
                                 'delta': delta,
