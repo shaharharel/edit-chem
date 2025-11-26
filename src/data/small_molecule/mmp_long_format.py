@@ -440,9 +440,9 @@ class LongFormatMMPExtractor:
             ]
 
             with mp.Pool(processes=num_workers) as pool:
-                # Use imap_unordered for true parallel processing (order doesn't matter)
+                # Use imap with chunksize like fragmentation step for better parallelization
                 results = list(tqdm(
-                    pool.imap_unordered(_worker_wrapper_for_imap, worker_args, chunksize=1),
+                    pool.imap(_worker_wrapper_for_imap, worker_args, chunksize=100),
                     total=len(worker_args),
                     desc="Processing chunks"
                 ))

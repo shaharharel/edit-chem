@@ -135,6 +135,19 @@ def generate_report(results: Dict, config, trained_models: Dict = None, embeddin
         params = config.splitter_params[config.splitter_type]
         doc.add_paragraph(f"Splitter Parameters: {params}")
 
+    # Few-shot metadata (if applicable)
+    if hasattr(config, 'few_shot_metadata') and config.few_shot_metadata:
+        doc.add_heading('Few-Shot Learning Configuration', 3)
+        metadata = config.few_shot_metadata
+        doc.add_paragraph(f"Few-Shot Fraction: {metadata['few_shot_fraction']*100:.0f}%")
+        doc.add_paragraph(f"Few-Shot Samples per Property: {metadata['few_shot_samples']}")
+        doc.add_paragraph(f"\nFew-Shot Properties ({len(metadata['few_shot_properties'])}):")
+        for prop in metadata['few_shot_properties']:
+            doc.add_paragraph(f"  • {prop}", style='List Bullet')
+        doc.add_paragraph(f"\nRegular Properties ({len(metadata['regular_properties'])}):")
+        for prop in metadata['regular_properties']:
+            doc.add_paragraph(f"  • {prop}", style='List Bullet')
+
     # Embedding Configuration
     doc.add_heading('Embedding Configuration', 2)
     doc.add_paragraph(f"Embedder Type: {config.embedder_type}")
