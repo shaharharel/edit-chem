@@ -908,37 +908,83 @@ class LongFormatMMPExtractor:
     @staticmethod
     def _merge_worker_files(worker_files: List[str], final_output: Path) -> None:
         """
-        Merge worker output files into final CSV.
+        Merge worker output files into final CSV with deduplication.
+
+        Since molecules can appear in multiple cores (from fragmentation),
+        the same pair can be extracted multiple times. We deduplicate based on:
+        (mol_a, mol_b, property_name, target_chembl_id)
 
         Args:
             worker_files: List of paths to worker CSV files
             final_output: Path to final merged CSV file
         """
-        logger.info(f"Merging {len(worker_files)} worker files...")
+        logger.info(f"Merging {len(worker_files)} worker files with deduplication...")
 
-        with open(final_output, 'w', buffering=1024*1024) as out:
+        import csv
+
+        # Track seen pairs to deduplicate
+        seen_pairs = set()
+        duplicates_skipped = 0
+        rows_written = 0
+
+        with open(final_output, 'w', newline='', buffering=1024*1024) as out:
+            csv_writer = csv.writer(out, quoting=csv.QUOTE_MINIMAL)
+
             # Write header
-            out.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,"
-                     "delta,target_name,target_chembl_id,doc_id_a,doc_id_b,"
-                     "assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,"
-                     "attach_atoms_A,mapped_pairs\n")
+            csv_writer.writerow([
+                'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name',
+                'value_a', 'value_b', 'delta', 'target_name', 'target_chembl_id',
+                'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b',
+                'removed_atoms_A', 'added_atoms_B', 'attach_atoms_A', 'mapped_pairs'
+            ])
 
-            # Concatenate worker files
+            # Read and deduplicate worker files
             for worker_file in tqdm(worker_files, desc="Merging"):
                 if not Path(worker_file).exists():
                     logger.warning(f"Worker file not found: {worker_file}")
                     continue
 
-                with open(worker_file, 'r') as f:
+                with open(worker_file, 'r', newline='') as f:
+                    csv_reader = csv.reader(f)
+
                     # Skip header if it exists
-                    first_line = f.readline()
-                    if not first_line.startswith('mol_a,'):
-                        # Not a header, write it
-                        out.write(first_line)
-                    # Write rest of file
-                    out.write(f.read())
+                    first_row = next(csv_reader, None)
+                    if first_row and first_row[0] != 'mol_a':
+                        # Not a header, process this row
+                        mol_a, mol_b, edit_smiles, num_cuts, property_name = first_row[:5]
+                        target_chembl_id = first_row[9] if len(first_row) > 9 else ''
+
+                        # Create deduplication key
+                        pair_key = (mol_a, mol_b, property_name, target_chembl_id)
+
+                        if pair_key not in seen_pairs:
+                            seen_pairs.add(pair_key)
+                            csv_writer.writerow(first_row)
+                            rows_written += 1
+                        else:
+                            duplicates_skipped += 1
+
+                    # Process remaining rows
+                    for row in csv_reader:
+                        if not row:
+                            continue
+
+                        mol_a, mol_b, edit_smiles, num_cuts, property_name = row[:5]
+                        target_chembl_id = row[9] if len(row) > 9 else ''
+
+                        # Create deduplication key
+                        pair_key = (mol_a, mol_b, property_name, target_chembl_id)
+
+                        if pair_key not in seen_pairs:
+                            seen_pairs.add(pair_key)
+                            csv_writer.writerow(row)
+                            rows_written += 1
+                        else:
+                            duplicates_skipped += 1
 
         logger.info(f"✓ Merged to {final_output}")
+        logger.info(f"  Rows written: {rows_written:,}")
+        logger.info(f"  Duplicates skipped: {duplicates_skipped:,}")
 
     @staticmethod
     def _process_core_chunk_worker(
@@ -973,6 +1019,7 @@ class LongFormatMMPExtractor:
             Path to worker output file
         """
         import pickle
+        import csv
         from rdkit import Chem
         from rdkit.Chem import Descriptors
 
@@ -990,17 +1037,22 @@ class LongFormatMMPExtractor:
             if mw is not None:
                 mw_lookup[chembl_id] = mw
 
-        # Open output file
+        # Open output file with CSV writer for proper escaping
         pair_buffer = []
         pairs_written = 0
         cores_processed = 0
 
-        with open(output_file, 'w', buffering=1024*1024) as f:
+        with open(output_file, 'w', newline='', buffering=1024*1024) as f:
+            # Create CSV writer with proper quoting
+            csv_writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+
             # Write header
-            f.write("mol_a,mol_b,edit_smiles,num_cuts,property_name,value_a,value_b,"
-                   "delta,target_name,target_chembl_id,doc_id_a,doc_id_b,"
-                   "assay_id_a,assay_id_b,removed_atoms_A,added_atoms_B,"
-                   "attach_atoms_A,mapped_pairs\n")
+            csv_writer.writerow([
+                'mol_a', 'mol_b', 'edit_smiles', 'num_cuts', 'property_name',
+                'value_a', 'value_b', 'delta', 'target_name', 'target_chembl_id',
+                'doc_id_a', 'doc_id_b', 'assay_id_a', 'assay_id_b',
+                'removed_atoms_A', 'added_atoms_B', 'attach_atoms_A', 'mapped_pairs'
+            ])
 
             # Process each core in the chunk
             total_cores = len(chunk['cores'])
@@ -1130,12 +1182,14 @@ class LongFormatMMPExtractor:
                             # Flush buffer if needed
                             if len(pair_buffer) >= micro_batch_size:
                                 for pair in pair_buffer:
-                                    f.write(f"{pair['mol_a']},{pair['mol_b']},{pair['edit_smiles']},"
-                                           f"{pair['num_cuts']},{pair['property_name']},{pair['value_a']},"
-                                           f"{pair['value_b']},{pair['delta']},{pair['target_name']},"
-                                           f"{pair['target_chembl_id']},{pair['doc_id_a']},{pair['doc_id_b']},"
-                                           f"{pair['assay_id_a']},{pair['assay_id_b']},{pair['removed_atoms_A']},"
-                                           f"{pair['added_atoms_B']},{pair['attach_atoms_A']},{pair['mapped_pairs']}\n")
+                                    csv_writer.writerow([
+                                        pair['mol_a'], pair['mol_b'], pair['edit_smiles'],
+                                        pair['num_cuts'], pair['property_name'], pair['value_a'],
+                                        pair['value_b'], pair['delta'], pair['target_name'],
+                                        pair['target_chembl_id'], pair['doc_id_a'], pair['doc_id_b'],
+                                        pair['assay_id_a'], pair['assay_id_b'], pair['removed_atoms_A'],
+                                        pair['added_atoms_B'], pair['attach_atoms_A'], pair['mapped_pairs']
+                                    ])
                                 pair_buffer = []
 
                                 # Save checkpoint
@@ -1152,12 +1206,14 @@ class LongFormatMMPExtractor:
             # Flush remaining pairs
             if pair_buffer:
                 for pair in pair_buffer:
-                    f.write(f"{pair['mol_a']},{pair['mol_b']},{pair['edit_smiles']},"
-                           f"{pair['num_cuts']},{pair['property_name']},{pair['value_a']},"
-                           f"{pair['value_b']},{pair['delta']},{pair['target_name']},"
-                           f"{pair['target_chembl_id']},{pair['doc_id_a']},{pair['doc_id_b']},"
-                           f"{pair['assay_id_a']},{pair['assay_id_b']},{pair['removed_atoms_A']},"
-                           f"{pair['added_atoms_B']},{pair['attach_atoms_A']},{pair['mapped_pairs']}\n")
+                    csv_writer.writerow([
+                        pair['mol_a'], pair['mol_b'], pair['edit_smiles'],
+                        pair['num_cuts'], pair['property_name'], pair['value_a'],
+                        pair['value_b'], pair['delta'], pair['target_name'],
+                        pair['target_chembl_id'], pair['doc_id_a'], pair['doc_id_b'],
+                        pair['assay_id_a'], pair['assay_id_b'], pair['removed_atoms_A'],
+                        pair['added_atoms_B'], pair['attach_atoms_A'], pair['mapped_pairs']
+                    ])
 
         # Mark as complete
         with open(checkpoint_file, 'wb') as cp:
