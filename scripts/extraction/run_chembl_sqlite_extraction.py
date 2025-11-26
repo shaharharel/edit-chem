@@ -83,6 +83,11 @@ class SQLiteChEMBLExtractor:
 
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_path)
+        # Optimize SQLite for better performance
+        self.conn.execute("PRAGMA temp_store = MEMORY")  # Use RAM for temp files
+        self.conn.execute("PRAGMA cache_size = -2000000")  # 2GB cache
+        self.conn.execute("PRAGMA mmap_size = 30000000000")  # 30GB memory-mapped I/O
+        self.conn.execute("PRAGMA page_size = 4096")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
