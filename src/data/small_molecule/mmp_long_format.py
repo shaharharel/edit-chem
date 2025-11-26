@@ -135,7 +135,7 @@ class LongFormatMMPExtractor:
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 1000,
         resume_from_checkpoint: bool = True,
-        micro_batch_size: int = 200,  # NEW: Flush every N pairs
+        micro_batch_size: int = 1_000_000,  # Flush every 1M pairs to reduce disk I/O
         property_filter: Optional[set] = None,  # NEW: Only extract these properties
         n_jobs: int = -1,  # NEW: Number of CPU cores for parallelization (-1 = all cores)
         min_molecules_per_core: int = 10,  # NEW: Minimum molecules per core to keep
@@ -335,10 +335,14 @@ class LongFormatMMPExtractor:
             checkpoint_path = Path(checkpoint_dir)
             checkpoint_path.mkdir(parents=True, exist_ok=True)
         else:
-            # Create temporary directory for parallel processing
-            import tempfile
-            checkpoint_path = Path(tempfile.mkdtemp(prefix="mmp_parallel_"))
-            logger.info(f"  Created temporary checkpoint dir: {checkpoint_path}")
+            # Use project-level cache directory instead of /tmp
+            import uuid
+            from pathlib import Path
+            project_cache = Path(__file__).parent.parent.parent.parent / ".cache" / "mmp_extraction"
+            project_cache.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = project_cache / f"mmp_parallel_{uuid.uuid4().hex[:8]}"
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"  Created checkpoint dir: {checkpoint_path}")
 
         # Create balanced chunks
         logger.info(f"  Creating balanced chunks (target: 500 molecules per chunk)...")
@@ -995,7 +999,7 @@ class LongFormatMMPExtractor:
         fragments: Dict,
         max_mw_delta: float,
         checkpoint_dir: str,
-        micro_batch_size: int = 1000,
+        micro_batch_size: int = 1_000_000,
         property_filter: Optional[set] = None
     ) -> str:
         """
@@ -1179,7 +1183,7 @@ class LongFormatMMPExtractor:
                             pair_buffer.append(row)
                             pairs_written += 1
 
-                            # Flush buffer if needed
+                            # Flush buffer if needed (write to CSV but don't checkpoint every time)
                             if len(pair_buffer) >= micro_batch_size:
                                 for pair in pair_buffer:
                                     csv_writer.writerow([
@@ -1191,15 +1195,6 @@ class LongFormatMMPExtractor:
                                         pair['added_atoms_B'], pair['attach_atoms_A'], pair['mapped_pairs']
                                     ])
                                 pair_buffer = []
-
-                                # Save checkpoint
-                                with open(checkpoint_file, 'wb') as cp:
-                                    pickle.dump({
-                                        'chunk_id': chunk_id,
-                                        'pairs_written': pairs_written,
-                                        'cores_processed': cores_processed,
-                                        'completed': False
-                                    }, cp)
 
                 cores_processed += 1
 
