@@ -27,6 +27,7 @@ class PropertyPredictorMLP(pl.LightningModule):
     Args:
         input_dim: Input embedding dimension
         hidden_dims: Optional list of hidden dimensions. If None, auto-generates halving layers
+        head_hidden_dims: Optional list of hidden dims for task heads (e.g., [256, 256, 256, 128])
         dropout: Dropout probability
         learning_rate: Learning rate for Adam optimizer
         activation: Activation function ('relu', 'elu', 'gelu')
@@ -39,6 +40,7 @@ class PropertyPredictorMLP(pl.LightningModule):
         self,
         input_dim: int,
         hidden_dims: Optional[List[int]] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
         activation: str = 'relu',
@@ -128,8 +130,8 @@ class PropertyPredictorMLP(pl.LightningModule):
             # Shared dimension (last hidden dim or input_dim/4)
             shared_dim = hidden_dims[-1] if hidden_dims else max(input_dim // 4, 64)
 
-            # Head hidden dimension (smaller than shared)
-            head_hidden_dim = max(shared_dim // 2, 32)
+            # Head hidden dimension (smaller than shared) - only used if head_hidden_dims not provided
+            head_hidden_dim = max(shared_dim // 2, 32) if head_hidden_dims is None else None
 
             self.multi_task_network = MultiTaskNetwork(
                 input_dim=input_dim,
@@ -137,6 +139,7 @@ class PropertyPredictorMLP(pl.LightningModule):
                 backbone_hidden_dims=hidden_dims,
                 shared_dim=shared_dim,
                 head_hidden_dim=head_hidden_dim,
+                head_hidden_dims=head_hidden_dims,
                 dropout=dropout,
                 activation=activation
             )
@@ -357,6 +360,7 @@ class PropertyPredictor:
         self,
         embedder,
         hidden_dims: Optional[List[int]] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
         batch_size: int = 32,
@@ -371,6 +375,7 @@ class PropertyPredictor:
         Args:
             embedder: MoleculeEmbedder instance (FingerprintEmbedder, ChemBERTaEmbedder, etc.)
             hidden_dims: Hidden layer dimensions (None for auto)
+            head_hidden_dims: Hidden dims for task heads (e.g., [256, 256, 256, 128])
             dropout: Dropout probability
             learning_rate: Learning rate
             batch_size: Batch size
@@ -381,6 +386,7 @@ class PropertyPredictor:
         """
         self.embedder = embedder
         self.hidden_dims = hidden_dims
+        self.head_hidden_dims = head_hidden_dims
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -500,6 +506,7 @@ class PropertyPredictor:
         self.model = PropertyPredictorMLP(
             input_dim=input_dim,
             hidden_dims=self.hidden_dims,
+            head_hidden_dims=self.head_hidden_dims,
             dropout=self.dropout,
             learning_rate=self.learning_rate,
             n_tasks=self.n_tasks,

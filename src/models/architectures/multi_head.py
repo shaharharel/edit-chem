@@ -96,12 +96,12 @@ class TaskHead(nn.Module):
     Task-specific prediction head for multi-task learning.
 
     Takes shared representation and produces task-specific predictions.
-    Typically lightweight (1-2 layers) since most learning happens in backbone.
 
     Args:
         input_dim: Dimension of shared representation
-        hidden_dim: Optional hidden layer dimension
-        dropout: Dropout probability
+        hidden_dim: Optional single hidden layer dimension (legacy, use hidden_dims for multiple)
+        hidden_dims: Optional list of hidden layer dimensions (e.g., [256, 256, 256, 128])
+        dropout: Dropout probability (not applied to last layer)
         activation: Activation function
 
     """
@@ -110,6 +110,7 @@ class TaskHead(nn.Module):
         self,
         input_dim: int,
         hidden_dim: Optional[int] = None,
+        hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.1,
         activation: str = 'relu'
     ):
@@ -128,8 +129,21 @@ class TaskHead(nn.Module):
             raise ValueError(f"Unknown activation: {activation}")
 
         # Build head
-        if hidden_dim is not None:
-            # Two-layer head
+        if hidden_dims is not None:
+            # Multi-layer head with configurable dims
+            layers = []
+            prev_dim = input_dim
+            for i, dim in enumerate(hidden_dims):
+                layers.append(nn.Linear(prev_dim, dim))
+                layers.append(act_fn())
+                # No dropout on last hidden layer (before output)
+                if i < len(hidden_dims) - 1:
+                    layers.append(nn.Dropout(dropout))
+                prev_dim = dim
+            layers.append(nn.Linear(prev_dim, 1))
+            self.network = nn.Sequential(*layers)
+        elif hidden_dim is not None:
+            # Legacy two-layer head
             self.network = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
                 act_fn(),
@@ -162,8 +176,9 @@ class MultiTaskHead(nn.Module):
     Args:
         shared_dim: Dimension of shared representation from backbone
         task_names: List of task names (e.g., ['logP', 'QED', 'SAS'])
-        head_hidden_dim: Optional hidden dimension for task heads
-        dropout: Dropout probability for task heads
+        head_hidden_dim: Optional single hidden dimension for task heads (legacy)
+        head_hidden_dims: Optional list of hidden dims for task heads (e.g., [256, 256, 256, 128])
+        dropout: Dropout probability for task heads (not applied to last layer)
         activation: Activation function for task heads
 
     """
@@ -173,6 +188,7 @@ class MultiTaskHead(nn.Module):
         shared_dim: int,
         task_names: List[str],
         head_hidden_dim: Optional[int] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.1,
         activation: str = 'relu'
     ):
@@ -187,6 +203,7 @@ class MultiTaskHead(nn.Module):
             task_name: TaskHead(
                 input_dim=shared_dim,
                 hidden_dim=head_hidden_dim,
+                hidden_dims=head_hidden_dims,
                 dropout=dropout,
                 activation=activation
             )
@@ -239,7 +256,8 @@ class MultiTaskNetwork(nn.Module):
         task_names: List of task names
         backbone_hidden_dims: Hidden dimensions for shared backbone
         shared_dim: Dimension of shared representation
-        head_hidden_dim: Optional hidden dimension for task heads
+        head_hidden_dim: Optional single hidden dimension for task heads (legacy)
+        head_hidden_dims: Optional list of hidden dims for task heads (e.g., [256, 256, 256, 128])
         dropout: Dropout probability
         activation: Activation function
 
@@ -252,6 +270,7 @@ class MultiTaskNetwork(nn.Module):
         backbone_hidden_dims: List[int],
         shared_dim: int,
         head_hidden_dim: Optional[int] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         activation: str = 'relu'
     ):
@@ -275,6 +294,7 @@ class MultiTaskNetwork(nn.Module):
             shared_dim=shared_dim,
             task_names=task_names,
             head_hidden_dim=head_hidden_dim,
+            head_hidden_dims=head_hidden_dims,
             dropout=dropout,
             activation=activation
         )

@@ -57,7 +57,7 @@ class ChEMBLLongFormat:
     def get_top_targets(
         self,
         top_n: int = 100,
-        activity_types: List[str] = ['IC50', 'Ki', 'EC50', 'Kd'],
+        activity_types: Optional[List[str]] = ['IC50', 'Ki', 'EC50', 'Kd'],
         min_molecules: int = 1000
     ) -> pd.DataFrame:
         """
@@ -65,7 +65,7 @@ class ChEMBLLongFormat:
 
         Args:
             top_n: Number of top targets to return
-            activity_types: Which activity types to consider
+            activity_types: Which activity types to consider (None = all with pchembl_value)
             min_molecules: Minimum molecules tested per target
 
         Returns:
@@ -73,7 +73,12 @@ class ChEMBLLongFormat:
         """
         logger.info(f"Finding top {top_n} most-tested targets...")
 
-        activity_filter = "', '".join(activity_types)
+        # Build activity type filter (or skip if None = all activities)
+        if activity_types:
+            activity_filter = "', '".join(activity_types)
+            activity_clause = f"AND act.standard_type IN ('{activity_filter}')"
+        else:
+            activity_clause = ""  # No filtering - get all activity types with pchembl_value
 
         query = f"""
         SELECT
@@ -90,11 +95,11 @@ class ChEMBLLongFormat:
         JOIN compound_structures cs ON md.molregno = cs.molregno
 
         WHERE
-            act.standard_type IN ('{activity_filter}')
-            AND act.pchembl_value IS NOT NULL
+            act.pchembl_value IS NOT NULL
             AND act.standard_relation = '='
             AND cs.canonical_smiles IS NOT NULL
             AND td.target_type IN ('SINGLE PROTEIN', 'PROTEIN COMPLEX')
+            {activity_clause}
 
         GROUP BY td.chembl_id, td.pref_name, td.target_type
         HAVING COUNT(DISTINCT md.molregno) >= {min_molecules}
@@ -118,10 +123,10 @@ class ChEMBLLongFormat:
 
     def download_all_with_bioactivity(
         self,
-        max_molecules: int = 1000000,
+        max_molecules: Optional[int] = None,
         max_mw: float = 800,
         min_mw: float = 100,
-        activity_types: List[str] = ['IC50', 'Ki', 'EC50', 'Kd'],
+        activity_types: Optional[List[str]] = ['IC50', 'Ki', 'EC50', 'Kd'],
         top_targets: Optional[int] = None,
         computed_properties: Optional[List[str]] = None
     ) -> pd.DataFrame:
@@ -136,7 +141,7 @@ class ChEMBLLongFormat:
             max_molecules: Maximum molecules to download
             max_mw: Maximum molecular weight
             min_mw: Minimum molecular weight
-            activity_types: Activity types to include
+            activity_types: Activity types to include (None = all with pchembl_value)
             top_targets: If set, only get molecules tested on top N targets
                         (RECOMMENDED: 100-200 for maximum pair density!)
 
@@ -152,13 +157,21 @@ class ChEMBLLongFormat:
         else:
             logger.info(f" Strategy: Get ALL molecules with ANY bioactivity")
 
-        logger.info(f" Max molecules: {max_molecules:,}")
+        logger.info(f" Max molecules: {max_molecules:,}" if max_molecules else " Max molecules: no limit")
         logger.info(f" MW range: {min_mw}-{max_mw}")
-        logger.info(f" Activity types: {', '.join(activity_types)}")
+        if activity_types:
+            logger.info(f" Activity types: {', '.join(activity_types)}")
+        else:
+            logger.info(f" Activity types: ALL (any with pchembl_value)")
         logger.info("=" * 70)
         logger.info("")
 
-        activity_filter = "', '".join(activity_types)
+        # Build activity type filter (or skip if None = all activities)
+        if activity_types:
+            activity_filter = "', '".join(activity_types)
+            activity_clause = f"AND act.standard_type IN ('{activity_filter}')"
+        else:
+            activity_clause = ""  # No filtering - get all activity types with pchembl_value
 
         # Optional: Get top targets first
         target_filter = None
@@ -257,31 +270,34 @@ class ChEMBLLongFormat:
                 FROM activities act
                 """
 
+        # Build LIMIT clause (optional)
+        limit_clause = f"LIMIT {max_molecules}" if max_molecules else ""
+
         # Add target filter if specified
         if target_filter:
             query_molecules += f"""
                 JOIN assays ass ON act.assay_id = ass.assay_id
                 JOIN target_dictionary td ON ass.tid = td.tid
                 WHERE act.molregno = md.molregno
-                AND act.standard_type IN ('{activity_filter}')
                 AND act.pchembl_value IS NOT NULL
                 AND act.standard_relation = '='
                 AND td.chembl_id IN ('{target_filter}')
+                {activity_clause}
                 LIMIT 1
             )
 
-        LIMIT {max_molecules};
+        {limit_clause};
         """
         else:
             query_molecules += f"""
                 WHERE act.molregno = md.molregno
-                AND act.standard_type IN ('{activity_filter}')
                 AND act.pchembl_value IS NOT NULL
                 AND act.standard_relation = '='
+                {activity_clause}
                 LIMIT 1
             )
 
-        LIMIT {max_molecules};
+        {limit_clause};
         """
 
         df_molecules = self.chembl.query(query_molecules)
@@ -299,7 +315,7 @@ class ChEMBLLongFormat:
     def download_all_bioactivity(
         self,
         molecules_df: pd.DataFrame,
-        activity_types: List[str] = ['IC50', 'Ki', 'EC50', 'Kd'],
+        activity_types: Optional[List[str]] = ['IC50', 'Ki', 'EC50', 'Kd'],
         target_filter: Optional[List[str]] = None
     ) -> pd.DataFrame:
         """
@@ -309,7 +325,7 @@ class ChEMBLLongFormat:
 
         Args:
             molecules_df: DataFrame with molecules (must have 'chembl_id' column)
-            activity_types: Activity types to include
+            activity_types: Activity types to include (None = all with pchembl_value)
             target_filter: Optional list of target ChEMBL IDs to filter by
 
         Returns:
@@ -321,7 +337,12 @@ class ChEMBLLongFormat:
             logger.info(f"  Filtering to {len(target_filter)} targets")
         logger.info("")
 
-        activity_filter = "', '".join(activity_types)
+        # Build activity type filter (or skip if None = all activities)
+        if activity_types:
+            activity_filter = "', '".join(activity_types)
+            activity_clause = f"AND act.standard_type IN ('{activity_filter}')"
+        else:
+            activity_clause = ""  # No filtering - get all activity types with pchembl_value
 
         # Get chembl_ids
         chembl_ids = molecules_df['chembl_id'].tolist()
@@ -341,10 +362,10 @@ class ChEMBLLongFormat:
             where_clause = f"""
             WHERE
                 md.chembl_id IN ('{chembl_filter}')
-                AND act.standard_type IN ('{activity_filter}')
                 AND act.pchembl_value IS NOT NULL
                 AND act.standard_relation = '='
                 AND td.target_type IN ('SINGLE PROTEIN', 'PROTEIN COMPLEX')
+                {activity_clause}
             """
 
             if target_filter:
@@ -360,7 +381,9 @@ class ChEMBLLongFormat:
                 act.standard_type as activity_type,
                 act.pchembl_value,
                 act.standard_value,
-                act.standard_units
+                act.standard_units,
+                act.doc_id,
+                act.assay_id
 
             FROM activities act
             JOIN assays ass ON act.assay_id = ass.assay_id
@@ -389,7 +412,10 @@ class ChEMBLLongFormat:
             'pchembl_value': 'median',
             'target_chembl_id': 'first',
             'target_name': 'first',
-            'activity_type': 'first'
+            'activity_type': 'first',
+            'standard_units': 'first',  # Keep units for transparency
+            'doc_id': 'first',  # Keep doc_id for traceability
+            'assay_id': 'first'  # Keep assay_id for traceability
         }).reset_index()
 
         # Save bioactivity in long format
@@ -557,10 +583,10 @@ class ChEMBLLongFormat:
 
     def download_complete(
         self,
-        max_molecules: int = 1000000,
+        max_molecules: Optional[int] = None,
         max_mw: float = 800,
         min_mw: float = 100,
-        activity_types: List[str] = ['IC50', 'Ki', 'EC50', 'Kd'],
+        activity_types: Optional[List[str]] = ['IC50', 'Ki', 'EC50', 'Kd'],
         top_targets: Optional[int] = None,
         computed_properties: Optional[List[str]] = None,
         download_target_sequences: bool = False
@@ -569,6 +595,7 @@ class ChEMBLLongFormat:
         Complete download pipeline.
 
         Args:
+            activity_types: Activity types to include (None = all with pchembl_value)
             computed_properties: List of computed properties to include (default: all)
             download_target_sequences: If True, also download protein sequences for all targets (default: False)
 

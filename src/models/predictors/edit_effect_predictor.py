@@ -31,6 +31,7 @@ class EditEffectMLP(pl.LightningModule):
         mol_dim: Molecule embedding dimension
         edit_dim: Edit embedding dimension
         hidden_dims: Optional list of hidden dimensions. If None, auto-generates halving layers
+        head_hidden_dims: Optional list of hidden dims for task heads (e.g., [256, 256, 256, 128])
         dropout: Dropout probability
         learning_rate: Learning rate for Adam optimizer (MLP heads, default: 1e-3)
         activation: Activation function ('relu', 'elu', 'gelu')
@@ -49,6 +50,7 @@ class EditEffectMLP(pl.LightningModule):
         mol_dim: int,
         edit_dim: int,
         hidden_dims: Optional[List[int]] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
         activation: str = 'relu',
@@ -68,6 +70,7 @@ class EditEffectMLP(pl.LightningModule):
         self.learning_rate = learning_rate
         self.gnn_learning_rate = gnn_learning_rate if gnn_learning_rate is not None else 1e-5
         self.n_tasks = n_tasks
+        self.head_hidden_dims = head_hidden_dims
 
         # Trainable edit embedding layer
         self.trainable_edit_layer = trainable_edit_layer
@@ -150,8 +153,8 @@ class EditEffectMLP(pl.LightningModule):
             # Shared dimension
             shared_dim = hidden_dims[-1] if hidden_dims else max(self.input_dim // 4, 64)
 
-            # Head hidden dimension
-            head_hidden_dim = max(shared_dim // 2, 32)
+            # Head hidden dimension - only used if head_hidden_dims not provided
+            head_hidden_dim = max(shared_dim // 2, 32) if head_hidden_dims is None else None
 
             self.multi_task_network = MultiTaskNetwork(
                 input_dim=self.input_dim,
@@ -159,6 +162,7 @@ class EditEffectMLP(pl.LightningModule):
                 backbone_hidden_dims=hidden_dims,
                 shared_dim=shared_dim,
                 head_hidden_dim=head_hidden_dim,
+                head_hidden_dims=head_hidden_dims,
                 dropout=dropout,
                 activation=activation
             )
@@ -516,6 +520,7 @@ class EditEffectPredictor:
         mol_embedder,
         edit_embedder,
         hidden_dims: Optional[List[int]] = None,
+        head_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
         gnn_learning_rate: Optional[float] = None,
@@ -535,6 +540,7 @@ class EditEffectPredictor:
             mol_embedder: MoleculeEmbedder instance
             edit_embedder: EditEmbedder instance (not used if trainable_edit_embeddings=True)
             hidden_dims: Hidden layer dimensions (None for auto)
+            head_hidden_dims: Hidden dims for task heads (e.g., [256, 256, 256, 128])
             dropout: Dropout probability
             learning_rate: Learning rate for MLP heads (default: 1e-3)
             gnn_learning_rate: Learning rate for GNN parameters (default: 1e-5)
@@ -551,6 +557,7 @@ class EditEffectPredictor:
         self.mol_embedder = mol_embedder
         self.edit_embedder = edit_embedder
         self.hidden_dims = hidden_dims
+        self.head_hidden_dims = head_hidden_dims
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.gnn_learning_rate = gnn_learning_rate if gnn_learning_rate is not None else 1e-5
@@ -791,6 +798,7 @@ class EditEffectPredictor:
             mol_dim=mol_dim,
             edit_dim=edit_dim,
             hidden_dims=self.hidden_dims,
+            head_hidden_dims=self.head_hidden_dims,
             dropout=self.dropout,
             learning_rate=self.learning_rate,
             gnn_learning_rate=self.gnn_learning_rate,

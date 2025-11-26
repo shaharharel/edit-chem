@@ -57,6 +57,7 @@ def create_models(config, train_data: Dict, embedder) -> Dict:
                 embedder=embedder,
                 task_names=task_names,
                 hidden_dims=method_config.get('hidden_dims'),
+                head_hidden_dims=method_config.get('head_hidden_dims'),
                 dropout=method_config.get('dropout', 0.2),
                 learning_rate=method_config.get('lr', 0.001),
                 batch_size=method_config.get('batch_size', 32),
@@ -78,6 +79,7 @@ def create_models(config, train_data: Dict, embedder) -> Dict:
                 edit_embedder=edit_embedder,
                 task_names=task_names,
                 hidden_dims=method_config.get('hidden_dims'),
+                head_hidden_dims=method_config.get('head_hidden_dims'),
                 dropout=method_config.get('dropout', 0.2),
                 learning_rate=method_config.get('lr', 0.001),
                 gnn_learning_rate=method_config.get('gnn_lr', 1e-5),  # Separate LR for GNN

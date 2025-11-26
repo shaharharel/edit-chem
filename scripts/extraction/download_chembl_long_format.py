@@ -9,8 +9,15 @@ Usage:
     python download_chembl_long_format.py --max-molecules 1000000
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
 import logging
-from src.data.chembl_long_format import ChEMBLLongFormat
+from src.data.legacy.chembl_long_format import ChEMBLLongFormat
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,8 +32,8 @@ def main():
         description="Download ChEMBL optimized for long-format pairs"
     )
 
-    parser.add_argument('--max-molecules', type=int, default=1000000,
-                       help='Maximum molecules (default: 1000000)')
+    parser.add_argument('--max-molecules', type=int, default=None,
+                       help='Maximum molecules (default: no limit)')
     parser.add_argument('--max-mw', type=float, default=800,
                        help='Max MW (default: 800)')
     parser.add_argument('--min-mw', type=float, default=100,
@@ -34,6 +41,8 @@ def main():
     parser.add_argument('--activity-types', nargs='+',
                        default=['IC50', 'Ki', 'EC50', 'Kd'],
                        help='Activity types (default: IC50 Ki EC50 Kd)')
+    parser.add_argument('--all-activities', action='store_true',
+                       help='Include ALL activity types with pchembl_value (ignores --activity-types)')
     parser.add_argument('--top-targets', type=int, default=None,
                        help='Only get molecules from top N targets (RECOMMENDED: 100-200 for best pair density)')
     parser.add_argument('--computed-properties', nargs='+',
@@ -41,6 +50,10 @@ def main():
                        help='Computed properties to include (default: mw alogp hbd hba psa rtb aromatic_rings qed_weighted)')
     parser.add_argument('--download-target-sequences', action='store_true',
                        help='Download protein sequences for all targets (default: False)')
+    # Default db-dir relative to project root
+    default_db_dir = project_root / 'data' / 'small_molecules' / 'chembl_db'
+    parser.add_argument('--db-dir', type=str, default=str(default_db_dir),
+                       help=f'Directory containing ChEMBL database (default: {default_db_dir})')
 
     args = parser.parse_args()
 
@@ -59,9 +72,12 @@ def main():
 
     print()
     print(f" Configuration:")
-    print(f"   • Max molecules: {args.max_molecules:,}")
+    print(f"   • Max molecules: {args.max_molecules:,}" if args.max_molecules else "   • Max molecules: no limit")
     print(f"   • MW range: {args.min_mw}-{args.max_mw}")
-    print(f"   • Activity types: {', '.join(args.activity_types)}")
+    if args.all_activities:
+        print(f"   • Activity types: ALL (any with pchembl_value)")
+    else:
+        print(f"   • Activity types: {', '.join(args.activity_types)}")
 
     if args.top_targets:
         print(f"   • Top targets: {args.top_targets}")
@@ -77,13 +93,16 @@ def main():
 
     print()
 
-    downloader = ChEMBLLongFormat()
+    downloader = ChEMBLLongFormat(db_dir=args.db_dir)
+
+    # If --all-activities, pass None to disable activity type filtering
+    activity_types = None if args.all_activities else args.activity_types
 
     result = downloader.download_complete(
         max_molecules=args.max_molecules,
         max_mw=args.max_mw,
         min_mw=args.min_mw,
-        activity_types=args.activity_types,
+        activity_types=activity_types,
         top_targets=args.top_targets,
         computed_properties=args.computed_properties,
         download_target_sequences=args.download_target_sequences
