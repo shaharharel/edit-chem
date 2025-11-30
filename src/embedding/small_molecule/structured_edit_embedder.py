@@ -344,3 +344,130 @@ class StructuredEditEmbedder(nn.Module):
             'h_delta_local': h_delta_local,
             'v_delta_rdkit': v_delta_rdkit,
         }
+
+    def forward_batch(
+        self,
+        # Batched GNN embeddings (list of variable-length tensors)
+        H_A_list: List[torch.Tensor],  # List of [n_atoms_i, gnn_dim]
+        H_B_list: List[torch.Tensor],  # List of [n_atoms_i, gnn_dim]
+        h_A_global_batch: torch.Tensor,  # [batch_size, gnn_dim]
+        h_B_global_batch: torch.Tensor,  # [batch_size, gnn_dim]
+
+        # Batched MMP structural info
+        mol_A_list: List[Chem.Mol],
+        mol_B_list: List[Chem.Mol],
+        removed_atoms_list: List[List[int]],
+        added_atoms_list: List[List[int]],
+        attach_atoms_list: List[List[int]],
+        mapped_pairs_list: Optional[List[List[Tuple[int, int]]]] = None
+    ) -> torch.Tensor:
+        """
+        Batched forward pass for training efficiency.
+
+        Processes multiple samples in parallel where possible.
+
+        Args:
+            H_A_list: List of atom embedding tensors for molecule A
+            H_B_list: List of atom embedding tensors for molecule B
+            h_A_global_batch: Batched global embeddings for A [batch_size, gnn_dim]
+            h_B_global_batch: Batched global embeddings for B [batch_size, gnn_dim]
+            mol_A_list: List of RDKit Mol objects for A
+            mol_B_list: List of RDKit Mol objects for B
+            removed_atoms_list: List of removed atom indices per sample
+            added_atoms_list: List of added atom indices per sample
+            attach_atoms_list: List of attachment atom indices per sample
+            mapped_pairs_list: Optional list of mapped atom pairs per sample
+
+        Returns:
+            Batched edit embeddings [batch_size, output_dim]
+        """
+        batch_size = len(H_A_list)
+        device = h_A_global_batch.device
+
+        if mapped_pairs_list is None:
+            mapped_pairs_list = [None] * batch_size
+
+        # Process each sample
+        edit_embeddings = []
+        for i in range(batch_size):
+            result = self.forward(
+                H_A=H_A_list[i],
+                H_B=H_B_list[i],
+                h_A_global=h_A_global_batch[i],
+                h_B_global=h_B_global_batch[i],
+                mol_A=mol_A_list[i],
+                mol_B=mol_B_list[i],
+                removed_atom_indices_A=removed_atoms_list[i],
+                added_atom_indices_B=added_atoms_list[i],
+                attach_atom_indices_A=attach_atoms_list[i],
+                mapped_atom_pairs=mapped_pairs_list[i]
+            )
+            edit_embeddings.append(result['edit_embedding'])
+
+        return torch.stack(edit_embeddings, dim=0)  # [batch_size, output_dim]
+
+    def forward_from_smiles(
+        self,
+        mol_a_smiles: str,
+        mol_b_smiles: str,
+        embedder,  # ChemPropEmbedder with encode_with_atom_embeddings
+        removed_atom_indices_A: List[int],
+        added_atom_indices_B: List[int],
+        attach_atom_indices_A: List[int],
+        mapped_atom_pairs: Optional[List[Tuple[int, int]]] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Convenience method: compute edit embedding from SMILES strings.
+
+        This is useful for inference when you have SMILES and MMP info but
+        not pre-computed embeddings.
+
+        Args:
+            mol_a_smiles: SMILES of molecule A
+            mol_b_smiles: SMILES of molecule B
+            embedder: ChemPropEmbedder instance (must support encode_with_atom_embeddings)
+            removed_atom_indices_A: Indices of removed atoms in A
+            added_atom_indices_B: Indices of added atoms in B
+            attach_atom_indices_A: Indices of attachment atoms in A
+            mapped_atom_pairs: Optional atom mapping between A and B
+
+        Returns:
+            Dictionary with edit embedding and components
+        """
+        # Get atom-level embeddings
+        H_A_np, h_A_global_np = embedder.encode_with_atom_embeddings(mol_a_smiles)
+        H_B_np, h_B_global_np = embedder.encode_with_atom_embeddings(mol_b_smiles)
+
+        # Convert to tensors
+        device = next(self.parameters()).device
+        H_A = torch.from_numpy(H_A_np).float().to(device)
+        H_B = torch.from_numpy(H_B_np).float().to(device)
+        h_A_global = torch.from_numpy(h_A_global_np).float().to(device)
+        h_B_global = torch.from_numpy(h_B_global_np).float().to(device)
+
+        # Get RDKit Mol objects
+        mol_A = Chem.MolFromSmiles(mol_a_smiles)
+        mol_B = Chem.MolFromSmiles(mol_b_smiles)
+
+        return self.forward(
+            H_A=H_A,
+            H_B=H_B,
+            h_A_global=h_A_global,
+            h_B_global=h_B_global,
+            mol_A=mol_A,
+            mol_B=mol_B,
+            removed_atom_indices_A=removed_atom_indices_A,
+            added_atom_indices_B=added_atom_indices_B,
+            attach_atom_indices_A=attach_atom_indices_A,
+            mapped_atom_pairs=mapped_atom_pairs
+        )
+
+    def freeze(self):
+        """Freeze all parameters (stop learning)."""
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze(self):
+        """Unfreeze all parameters (resume learning)."""
+        for param in self.parameters():
+            param.requires_grad = True

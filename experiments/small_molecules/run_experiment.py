@@ -4,8 +4,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from experiment_config import ExperimentConfig
 from data_loader import load_datasets
-from model_factory import create_models, create_embedder
-from embedding_prep import prepare_embeddings
+from model_factory import create_models
 from trainer import train_all_models
 from evaluator import evaluate_all_models
 from report_generator import generate_report
@@ -16,28 +15,16 @@ def run_experiment(config: ExperimentConfig):
 
     train_data, test_datasets = load_datasets(config)
 
-    embedder = create_embedder(
-        embedder_type=config.embedder_type,
-        trainable_gnn=config.trainable_gnn,
-        gnn_device=config.gnn_device
-    )
+    # Create models - each method has its own embedder
+    models = create_models(config, train_data, embedder=None)
 
-    models = create_models(config, train_data, embedder)
+    # Train all models (embeddings computed on-the-fly per method)
+    trained_models = train_all_models(models, train_data, config)
 
-    use_fragments = any(m.get('use_edit_fragments', False) for m in config.methods)
+    # Evaluate all models (embeddings computed on-the-fly per method)
+    results = evaluate_all_models(trained_models, train_data, test_datasets, config)
 
-    embeddings = prepare_embeddings(
-        train_data=train_data,
-        embedder=embedder,
-        use_fragments=use_fragments,
-        cache_dir='.embeddings_cache'
-    )
-
-    trained_models = train_all_models(models, train_data, config, embeddings)
-
-    results = evaluate_all_models(trained_models, train_data, test_datasets, config, embeddings)
-
-    report_path = generate_report(results, config, trained_models, embeddings, train_data)
+    report_path = generate_report(results, config, trained_models, {}, train_data)
 
     print(f"\nExperiment complete! Report saved to: {report_path}")
     return results, report_path

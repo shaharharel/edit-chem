@@ -6,6 +6,7 @@ from .base import MoleculeEmbedder
 from .fingerprints import FingerprintEmbedder
 from .edit_embedder import EditEmbedder
 from .trainable_edit_embedder import TrainableEditEmbedder, ConcatenationEditEmbedder
+from .structured_edit_embedder import StructuredEditEmbedder
 
 __all__ = [
     'MoleculeEmbedder',
@@ -13,6 +14,7 @@ __all__ = [
     'EditEmbedder',
     'TrainableEditEmbedder',
     'ConcatenationEditEmbedder',
+    'StructuredEditEmbedder',
 ]
 
 # Optional imports (require additional dependencies)

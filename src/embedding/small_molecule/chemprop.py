@@ -7,7 +7,7 @@ Compatible with ChemProp v2.x API.
 
 import numpy as np
 import torch.nn as nn
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Dict
 from .base import MoleculeEmbedder
 
 
@@ -163,12 +163,13 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
                 "Supported: 'morgan', 'rdkit2d', 'graph'"
             )
 
-    def encode(self, smiles: Union[str, List[str]]) -> np.ndarray:
+    def encode(self, smiles: Union[str, List[str]], show_progress: bool = False) -> np.ndarray:
         """
         Encode molecule(s) to embedding vectors using ChemProp v2.
 
         Args:
             smiles: Single SMILES string or list of SMILES
+            show_progress: If True, show tqdm progress bar (useful for large batches)
 
         Returns:
             Embedding vector(s) as numpy array
@@ -186,19 +187,20 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
 
         # Encode using appropriate method
         if self._use_model:
-            embeddings = self._encode_with_model(smiles_list)
+            embeddings = self._encode_with_model(smiles_list, show_progress=show_progress)
         else:
-            embeddings = self._encode_with_featurization(smiles_list)
+            embeddings = self._encode_with_featurization(smiles_list, show_progress=show_progress)
 
         if return_single:
             return embeddings[0]
         else:
             return embeddings
 
-    def _encode_with_model(self, smiles_list: List[str]) -> np.ndarray:
+    def _encode_with_model(self, smiles_list: List[str], show_progress: bool = False) -> np.ndarray:
         """Encode using trained ChemProp v2 model to extract learned representations."""
         import torch
         from chemprop.data import MoleculeDatapoint
+        from tqdm import tqdm
 
         # Create datapoints
         datapoints = [MoleculeDatapoint.from_smi(s) for s in smiles_list]
@@ -207,8 +209,13 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
         self.model.eval()
         embeddings = []
 
+        n_batches = (len(datapoints) + self.batch_size - 1) // self.batch_size
+        batch_iter = range(0, len(datapoints), self.batch_size)
+        if show_progress:
+            batch_iter = tqdm(batch_iter, total=n_batches, desc="Encoding (model)")
+
         with torch.no_grad():
-            for i in range(0, len(datapoints), self.batch_size):
+            for i in batch_iter:
                 batch_dps = datapoints[i:i + self.batch_size]
 
                 # Get model predictions (this uses the encoder internally)
@@ -226,22 +233,31 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
 
         return np.vstack(embeddings)
 
-    def _encode_with_featurization(self, smiles_list: List[str]) -> np.ndarray:
+    def _encode_with_featurization(self, smiles_list: List[str], show_progress: bool = False) -> np.ndarray:
         """
         Encode using ChemProp v2 featurization (Morgan, RDKit2D, or graph-based).
+
+        Args:
+            smiles_list: List of SMILES strings to encode
+            show_progress: If True, show tqdm progress bar
         """
         from chemprop.data import MoleculeDatapoint
+        from tqdm import tqdm
 
         # Create datapoints
         datapoints = [MoleculeDatapoint.from_smi(s) for s in smiles_list]
 
         # Graph-based encoding requires special handling
         if self.featurizer_type == 'graph':
-            return self._encode_with_graph_mpnn(datapoints)
+            return self._encode_with_graph_mpnn(datapoints, show_progress=show_progress)
 
         # Standard featurization (Morgan or RDKit2D)
         embeddings = []
-        for dp in datapoints:
+        feat_iter = datapoints
+        if show_progress:
+            feat_iter = tqdm(datapoints, desc=f"Encoding ({self.featurizer_type})")
+
+        for dp in feat_iter:
             try:
                 # Use the featurizer on the RDKit mol object
                 feat = self.featurizer(dp.mol)
@@ -253,18 +269,24 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
 
         return np.array(embeddings, dtype=np.float32)
 
-    def _encode_with_graph_mpnn(self, datapoints: List) -> np.ndarray:
+    def _encode_with_graph_mpnn(self, datapoints: List, show_progress: bool = False) -> np.ndarray:
         """
         Encode using D-MPNN graph neural network.
 
         Uses message passing on molecular graphs to get learned representations.
+
+        Args:
+            datapoints: List of MoleculeDatapoint objects
+            show_progress: If True, show tqdm progress bar
         """
         import torch
         from chemprop.data import BatchMolGraph
+        from tqdm import tqdm
 
         # Build molecular graphs
         mol_graphs = []
-        for dp in datapoints:
+        graph_iter = tqdm(datapoints, desc="Building graphs", disable=not show_progress)
+        for dp in graph_iter:
             try:
                 mol_graph = self.featurizer(dp.mol)
                 mol_graphs.append(mol_graph)
@@ -277,8 +299,12 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
         embeddings = []
         self.message_passing.eval()
 
+        n_batches = (len(mol_graphs) + self.batch_size - 1) // self.batch_size
         with torch.no_grad():
-            for i in range(0, len(mol_graphs), self.batch_size):
+            batch_iter = range(0, len(mol_graphs), self.batch_size)
+            if show_progress:
+                batch_iter = tqdm(batch_iter, total=n_batches, desc="Encoding batches")
+            for i in batch_iter:
                 batch_graphs = mol_graphs[i:i + self.batch_size]
 
                 # Filter out None graphs
@@ -385,3 +411,308 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
             print("ChemProp GNN unfrozen (gradients will backpropagate)")
         else:
             print("Warning: unfreeze_gnn() only applies to featurizer_type='graph'")
+
+    # Aliases for generalized encoder interface
+    def freeze(self):
+        """Freeze encoder parameters. Alias for freeze_gnn()."""
+        self.freeze_gnn()
+
+    def unfreeze(self):
+        """Unfreeze encoder parameters. Alias for unfreeze_gnn()."""
+        self.unfreeze_gnn()
+
+    def get_encoder_parameters(self):
+        """
+        Get trainable encoder parameters for optimizer.
+
+        Returns:
+            List of parameters that should be optimized with encoder learning rate.
+        """
+        if self.featurizer_type == 'graph' and hasattr(self, 'message_passing') and self.trainable:
+            return list(self.message_passing.parameters())
+        return []
+
+    def encode_with_atom_embeddings(
+        self,
+        smiles: Union[str, List[str]]
+    ) -> Union[tuple, List[tuple]]:
+        """
+        Encode molecule(s) returning both atom-level and molecule-level embeddings.
+
+        Only supported for featurizer_type='graph'. For other types, returns
+        molecule embedding duplicated for each atom.
+
+        Args:
+            smiles: Single SMILES string or list of SMILES
+
+        Returns:
+            For single SMILES: (atom_embeddings, mol_embedding)
+                - atom_embeddings: np.ndarray [n_atoms, embedding_dim]
+                - mol_embedding: np.ndarray [embedding_dim]
+            For list of SMILES: List of (atom_embeddings, mol_embedding) tuples
+        """
+        import torch
+        from rdkit import Chem
+
+        if isinstance(smiles, str):
+            smiles_list = [smiles]
+            return_single = True
+        else:
+            if isinstance(smiles, np.ndarray):
+                smiles_list = smiles.tolist()
+            else:
+                smiles_list = smiles
+            return_single = False
+
+        if self.featurizer_type != 'graph':
+            # For non-graph featurizers, return molecule embedding for each atom
+            results = []
+            mol_embeddings = self.encode(smiles_list)
+            for i, smi in enumerate(smiles_list):
+                mol = Chem.MolFromSmiles(smi)
+                n_atoms = mol.GetNumAtoms() if mol else 1
+                # Repeat molecule embedding for each atom (not ideal but compatible)
+                atom_emb = np.tile(mol_embeddings[i], (n_atoms, 1))
+                results.append((atom_emb, mol_embeddings[i]))
+
+            if return_single:
+                return results[0]
+            return results
+
+        # Graph-based encoding with atom-level embeddings
+        from chemprop.data import MoleculeDatapoint, BatchMolGraph
+
+        datapoints = [MoleculeDatapoint.from_smi(s) for s in smiles_list]
+        results = []
+
+        # Process one at a time to get individual atom embeddings
+        self.message_passing.eval()
+
+        with torch.no_grad():
+            for dp in datapoints:
+                try:
+                    mol_graph = self.featurizer(dp.mol)
+                    if mol_graph is None:
+                        raise ValueError("Failed to create mol graph")
+
+                    # Create single-molecule batch
+                    batch_graph = BatchMolGraph([mol_graph])
+
+                    # Get atom-level embeddings from message passing
+                    # h has shape [n_atoms_in_batch, hidden_dim]
+                    h = self.message_passing(batch_graph)
+
+                    # Get number of atoms in this molecule
+                    n_atoms = dp.mol.GetNumAtoms()
+
+                    # Extract atom embeddings for this molecule
+                    # Note: h includes all atoms, we take only actual atoms (not virtual)
+                    atom_embeddings = h[:n_atoms].cpu().numpy()
+
+                    # Aggregate for molecule embedding
+                    mol_embedding = self.aggregation(h, batch_graph.batch).cpu().numpy()[0]
+
+                    results.append((atom_embeddings.astype(np.float32),
+                                   mol_embedding.astype(np.float32)))
+
+                except Exception as e:
+                    print(f"Warning: Could not encode {dp.smiles} with atom embeddings: {e}")
+                    # Fallback: zeros
+                    mol = Chem.MolFromSmiles(dp.smiles) if dp else None
+                    n_atoms = mol.GetNumAtoms() if mol else 1
+                    results.append((
+                        np.zeros((n_atoms, self._embedding_dim), dtype=np.float32),
+                        np.zeros(self._embedding_dim, dtype=np.float32)
+                    ))
+
+        if return_single:
+            return results[0]
+        return results
+
+    def encode_trainable(
+        self,
+        smiles: Union[str, List[str]]
+    ) -> "torch.Tensor":
+        """
+        Encode molecule(s) to embedding tensors WITH gradient tracking.
+
+        This method is designed for end-to-end training where gradients need to
+        flow back through the GNN. Unlike encode(), this:
+        - Returns PyTorch tensors (not numpy arrays)
+        - Does NOT use torch.no_grad()
+        - Keeps the model in train() mode (if trainable=True)
+
+        Only supported for featurizer_type='graph'. For other types, falls back
+        to encode() wrapped as a tensor (no gradients possible).
+
+        Args:
+            smiles: Single SMILES string or list of SMILES
+
+        Returns:
+            torch.Tensor of shape [batch_size, embedding_dim] with gradient tracking
+        """
+        import torch
+        from chemprop.data import MoleculeDatapoint, BatchMolGraph
+
+        if isinstance(smiles, str):
+            smiles_list = [smiles]
+        else:
+            if isinstance(smiles, np.ndarray):
+                smiles_list = smiles.tolist()
+            else:
+                smiles_list = list(smiles)
+
+        # For non-graph featurizers, fall back to numpy encode (no gradient support)
+        if self.featurizer_type != 'graph':
+            embeddings = self.encode(smiles_list)
+            return torch.tensor(embeddings, dtype=torch.float32, device=self.device)
+
+        # Build molecular graphs
+        datapoints = [MoleculeDatapoint.from_smi(s) for s in smiles_list]
+        mol_graphs = []
+        valid_indices = []
+
+        for i, dp in enumerate(datapoints):
+            try:
+                mol_graph = self.featurizer(dp.mol)
+                if mol_graph is not None:
+                    mol_graphs.append(mol_graph)
+                    valid_indices.append(i)
+            except Exception as e:
+                print(f"Warning: Could not build graph for {dp.smiles}: {e}")
+
+        if not mol_graphs:
+            # All failed - return zeros
+            return torch.zeros(len(smiles_list), self._embedding_dim,
+                             dtype=torch.float32, device=self.device)
+
+        # Batch all graphs
+        batch_graph = BatchMolGraph(mol_graphs)
+
+        # Forward through message passing (NO torch.no_grad!)
+        # Keep train mode if trainable, otherwise eval
+        if self.trainable:
+            self.message_passing.train()
+        else:
+            self.message_passing.eval()
+
+        h = self.message_passing(batch_graph)
+        mol_embeddings = self.aggregation(h, batch_graph.batch)
+
+        # Handle failed graphs by inserting zeros
+        if len(valid_indices) < len(smiles_list):
+            full_embeddings = torch.zeros(len(smiles_list), self._embedding_dim,
+                                         dtype=torch.float32, device=self.device)
+            for new_idx, orig_idx in enumerate(valid_indices):
+                full_embeddings[orig_idx] = mol_embeddings[new_idx]
+            return full_embeddings
+
+        return mol_embeddings
+
+    def encode_trainable_with_atom_embeddings(
+        self,
+        smiles: Union[str, List[str]]
+    ) -> Dict[str, Union["torch.Tensor", List["torch.Tensor"]]]:
+        """
+        Encode molecule(s) returning both atom-level and molecule-level embeddings
+        WITH gradient tracking for end-to-end training.
+
+        This is the trainable version of encode_with_atom_embeddings().
+
+        Only supported for featurizer_type='graph'. For other types, falls back
+        to non-trainable encode_with_atom_embeddings().
+
+        Args:
+            smiles: Single SMILES string or list of SMILES
+
+        Returns:
+            Dictionary with:
+                - 'atom_embeddings': List of tensors [n_atoms_i, embedding_dim] per molecule
+                - 'mol_embeddings': Tensor [batch_size, embedding_dim]
+        """
+        import torch
+        from chemprop.data import MoleculeDatapoint, BatchMolGraph
+        from rdkit import Chem
+
+        if isinstance(smiles, str):
+            smiles_list = [smiles]
+        else:
+            if isinstance(smiles, np.ndarray):
+                smiles_list = smiles.tolist()
+            else:
+                smiles_list = list(smiles)
+
+        # For non-graph featurizers, fall back to numpy version wrapped as tensors
+        if self.featurizer_type != 'graph':
+            results = self.encode_with_atom_embeddings(smiles_list)
+            atom_embs = [torch.tensor(r[0], dtype=torch.float32, device=self.device) for r in results]
+            mol_embs = torch.tensor(np.stack([r[1] for r in results]), dtype=torch.float32, device=self.device)
+            return {'atom_embeddings': atom_embs, 'mol_embeddings': mol_embs}
+
+        # Build molecular graphs
+        datapoints = [MoleculeDatapoint.from_smi(s) for s in smiles_list]
+        mol_graphs = []
+        valid_indices = []
+        n_atoms_list = []
+
+        for i, dp in enumerate(datapoints):
+            try:
+                mol_graph = self.featurizer(dp.mol)
+                if mol_graph is not None:
+                    mol_graphs.append(mol_graph)
+                    valid_indices.append(i)
+                    n_atoms_list.append(dp.mol.GetNumAtoms())
+            except Exception as e:
+                print(f"Warning: Could not build graph for {dp.smiles}: {e}")
+
+        if not mol_graphs:
+            # All failed - return zeros
+            atom_embs = [torch.zeros(1, self._embedding_dim, dtype=torch.float32, device=self.device)
+                        for _ in smiles_list]
+            mol_embs = torch.zeros(len(smiles_list), self._embedding_dim,
+                                  dtype=torch.float32, device=self.device)
+            return {'atom_embeddings': atom_embs, 'mol_embeddings': mol_embs}
+
+        # Batch all graphs
+        batch_graph = BatchMolGraph(mol_graphs)
+
+        # Forward through message passing (NO torch.no_grad!)
+        if self.trainable:
+            self.message_passing.train()
+        else:
+            self.message_passing.eval()
+
+        # Get atom-level embeddings
+        h = self.message_passing(batch_graph)
+        mol_embeddings = self.aggregation(h, batch_graph.batch)
+
+        # Split atom embeddings by molecule
+        atom_embeddings_list = []
+        atom_offset = 0
+        for n_atoms in n_atoms_list:
+            atom_emb = h[atom_offset:atom_offset + n_atoms]
+            atom_embeddings_list.append(atom_emb)
+            atom_offset += n_atoms
+
+        # Handle failed graphs by inserting zeros
+        if len(valid_indices) < len(smiles_list):
+            full_atom_embs = []
+            full_mol_embs = torch.zeros(len(smiles_list), self._embedding_dim,
+                                       dtype=torch.float32, device=self.device)
+            valid_iter = iter(zip(valid_indices, atom_embeddings_list))
+            next_valid = next(valid_iter, None)
+
+            for i, smi in enumerate(smiles_list):
+                if next_valid and i == next_valid[0]:
+                    full_atom_embs.append(next_valid[1])
+                    full_mol_embs[i] = mol_embeddings[valid_indices.index(i)]
+                    next_valid = next(valid_iter, None)
+                else:
+                    mol = Chem.MolFromSmiles(smi)
+                    n_atoms = mol.GetNumAtoms() if mol else 1
+                    full_atom_embs.append(torch.zeros(n_atoms, self._embedding_dim,
+                                                     dtype=torch.float32, device=self.device))
+
+            return {'atom_embeddings': full_atom_embs, 'mol_embeddings': full_mol_embs}
+
+        return {'atom_embeddings': atom_embeddings_list, 'mol_embeddings': mol_embeddings}

@@ -21,6 +21,13 @@ def load_datasets(config) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFra
     df = df[df['edit_smiles'].notna() & df['mol_a'].notna() & df['mol_b'].notna() & df['delta'].notna()]
     print(f"After removing missing values: {len(df):,} pairs")
 
+    # Remove duplicates based on (mol_a, mol_b, property_name)
+    n_before = len(df)
+    df = df.drop_duplicates(subset=['mol_a', 'mol_b', 'property_name'], keep='first')
+    n_removed = n_before - len(df)
+    if n_removed > 0:
+        print(f"After removing duplicates (mol_a, mol_b, property_name): {len(df):,} pairs ({n_removed:,} removed)")
+
     property_counts = df.groupby('property_name').size()
     valid_properties = property_counts[property_counts >= config.min_pairs_per_property].index.tolist()
     df = df[df['property_name'].isin(valid_properties)]

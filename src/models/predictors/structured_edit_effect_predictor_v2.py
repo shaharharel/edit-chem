@@ -169,14 +169,23 @@ class StructuredEditEffectMLP(pl.LightningModule):
         Returns:
             Predictions [batch_size, n_tasks]
         """
+        # Get device from model parameters
+        device = next(self.structured_edit_embedder.parameters()).device
+
         # Process each example in batch through structured embedder
         edit_embeddings = []
         for i in range(len(batch['mol_A'])):
+            # Move tensors to device
+            H_A = batch['H_A'][i].to(device)
+            H_B = batch['H_B'][i].to(device)
+            h_A_global = batch['h_A_global'][i].to(device)
+            h_B_global = batch['h_B_global'][i].to(device)
+
             edit_features = self.structured_edit_embedder(
-                H_A=batch['H_A'][i],
-                H_B=batch['H_B'][i],
-                h_A_global=batch['h_A_global'][i],
-                h_B_global=batch['h_B_global'][i],
+                H_A=H_A,
+                H_B=H_B,
+                h_A_global=h_A_global,
+                h_B_global=h_B_global,
                 mol_A=batch['mol_A'][i],
                 mol_B=batch['mol_B'][i],
                 removed_atom_indices_A=batch['removed_atoms_A'][i],
@@ -275,7 +284,15 @@ class StructuredEditEffectMLP(pl.LightningModule):
             optimizer, mode='min', factor=0.5, patience=10
         )
 
-        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_loss', 'frequency': 1}}
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_loss',
+                'frequency': 1,
+                'strict': False  # Don't fail if val_loss is not available
+            }
+        }
 
 
 class StructuredEditEffectPredictor:

@@ -5,26 +5,33 @@ Uses transformer models pre-trained on SMILES:
 - ChemBERTa (seyonec/ChemBERTa-zinc-base-v1)
 - MolBERT
 - SMILES-BERT
+
+Supports both frozen (inference-only) and trainable modes for end-to-end learning.
 """
 
 import numpy as np
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from typing import Union, List, Optional
 from .base import MoleculeEmbedder
 
 
-class ChemBERTaEmbedder(MoleculeEmbedder):
+class ChemBERTaEmbedder(nn.Module, MoleculeEmbedder):
     """
     ChemBERTa-based molecule embedder.
 
     Uses transformer models trained on SMILES strings.
+    Supports both frozen and trainable modes for end-to-end learning.
 
     Args:
         model_name: HuggingFace model name or path
         pooling: Pooling strategy ('mean', 'cls', 'max')
         device: Device to run on ('cuda' or 'cpu')
         batch_size: Batch size for encoding multiple molecules
+        trainable: Whether transformer parameters should be trainable (default: False)
+                  If True, gradients will backpropagate through the transformer.
+                  If False, transformer is frozen (inference only).
     """
 
     DEFAULT_MODELS = {
@@ -38,8 +45,11 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
         model_name: str = 'chemberta',
         pooling: str = 'mean',
         device: Optional[str] = None,
-        batch_size: int = 32
+        batch_size: int = 32,
+        trainable: bool = False
     ):
+        super().__init__()  # Initialize nn.Module
+
         # Resolve model name
         if model_name in self.DEFAULT_MODELS:
             model_name = self.DEFAULT_MODELS[model_name]
@@ -47,6 +57,7 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
         self.model_name = model_name
         self.pooling = pooling
         self.batch_size = batch_size
+        self.trainable = trainable
 
         # Auto-detect device
         if device is None:
@@ -55,14 +66,24 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
             self.device = device
 
         # Load model and tokenizer
-        print(f"Loading {model_name}...")
+        trainable_str = "trainable" if trainable else "frozen"
+        print(f"Loading {model_name} ({trainable_str})...")
         import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.model = AutoModel.from_pretrained(model_name).to(self.device)
-        self.model.eval()  # Set to evaluation mode
+
+        # Control trainability
+        if self.trainable:
+            self.model.train()
+            print(f"  → Transformer parameters are TRAINABLE (gradients will backpropagate)")
+        else:
+            self.model.eval()
+            for param in self.model.parameters():
+                param.requires_grad = False
+            print(f"  → Transformer parameters are FROZEN (no gradient updates)")
 
         # Cache embedding dimension
         self._embedding_dim = self.model.config.hidden_size
@@ -137,6 +158,97 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
 
         return embeddings.cpu().numpy()
 
+    def _pool_embeddings(self, outputs, attention_mask) -> torch.Tensor:
+        """Apply pooling strategy to transformer outputs."""
+        if self.pooling == 'mean':
+            # Mean pool over sequence length (ignoring padding)
+            mask = attention_mask.unsqueeze(-1)
+            embeddings = (outputs.last_hidden_state * mask).sum(1) / mask.sum(1)
+        elif self.pooling == 'cls':
+            # Use [CLS] token embedding
+            embeddings = outputs.last_hidden_state[:, 0, :]
+        elif self.pooling == 'max':
+            # Max pool over sequence length
+            embeddings = outputs.last_hidden_state.max(dim=1)[0]
+        else:
+            raise ValueError(f"Invalid pooling: {self.pooling}")
+        return embeddings
+
+    def encode_trainable(self, smiles: Union[str, List[str]]) -> torch.Tensor:
+        """
+        Encode molecule(s) to embedding tensors WITH gradient tracking.
+
+        This method is designed for end-to-end training where gradients need to
+        flow back through the transformer. Unlike encode(), this:
+        - Returns PyTorch tensors (not numpy arrays)
+        - Does NOT use torch.no_grad()
+        - Keeps the model in train() mode (if trainable=True)
+
+        Args:
+            smiles: Single SMILES string or list of SMILES
+
+        Returns:
+            torch.Tensor of shape [batch_size, embedding_dim] with gradient tracking
+        """
+        if isinstance(smiles, str):
+            smiles_list = [smiles]
+        else:
+            if isinstance(smiles, np.ndarray):
+                smiles_list = smiles.tolist()
+            else:
+                smiles_list = list(smiles)
+
+        # Tokenize
+        inputs = self.tokenizer(
+            smiles_list,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
+        # Forward pass - NO torch.no_grad() to allow gradient flow
+        if self.trainable:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        outputs = self.model(**inputs)
+        embeddings = self._pool_embeddings(outputs, inputs['attention_mask'])
+
+        return embeddings
+
+    def freeze(self):
+        """
+        Freeze transformer parameters (stop gradient updates).
+        """
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.trainable = False
+        print("ChemBERTa transformer frozen (no gradient updates)")
+
+    def unfreeze(self):
+        """
+        Unfreeze transformer parameters (enable gradient updates).
+        """
+        self.model.train()
+        for param in self.model.parameters():
+            param.requires_grad = True
+        self.trainable = True
+        print("ChemBERTa transformer unfrozen (gradients will backpropagate)")
+
+    def get_encoder_parameters(self):
+        """
+        Get trainable encoder parameters for optimizer.
+
+        Returns:
+            List of parameters that should be optimized with encoder learning rate.
+        """
+        if self.trainable:
+            return list(self.model.parameters())
+        return []
+
     @property
     def embedding_dim(self) -> int:
         """Return the dimensionality of embeddings."""
@@ -146,7 +258,8 @@ class ChemBERTaEmbedder(MoleculeEmbedder):
     def name(self) -> str:
         """Return the name of this embedding method."""
         model_short = self.model_name.split('/')[-1]
-        return f"chemberta_{model_short}_{self.pooling}"
+        trainable_suffix = "_trainable" if self.trainable else "_frozen"
+        return f"chemberta_{model_short}_{self.pooling}{trainable_suffix}"
 
 
 # Convenience constructors
