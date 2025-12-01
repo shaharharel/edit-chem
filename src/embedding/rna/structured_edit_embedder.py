@@ -7,9 +7,12 @@ A sophisticated edit embedding module that captures:
 3. Position encoding (sinusoidal + learned)
 4. Local context (window ±10nt around edit)
 5. Attention context (attention-weighted token sum)
+6. (Optional) Δ-structure features (pairing prob, accessibility, entropy, MFE)
 
 This embedder takes sequence A and edit information (position, from, to)
 and produces a rich edit representation WITHOUT needing sequence B.
+
+Can be instantiated with RNA-FM or UTR-LM as the base embedder.
 """
 
 import math
@@ -79,42 +82,54 @@ class StructuredRNAEditEmbedder(nn.Module):
     3. Position encoding: Sinusoidal + learned
     4. Local context: Mean-pooled window around edit site
     5. Attention context: Attention-weighted token sum
-    6. Fusion MLP: Combines all components
+    6. (Optional) Structure features: Δ-pairing, Δ-accessibility, Δ-entropy, Δ-MFE
+    7. Fusion MLP: Combines all components
 
     Args:
-        rnafm_embedder: RNAFMEmbedder instance (pretrained, typically frozen)
+        base_embedder: Base embedder (RNAFMEmbedder or UTRLMEmbedder)
         mutation_type_dim: Dimension of mutation type embedding (default: 64)
         mutation_effect_dim: Dimension of projected mutation effect (default: 256)
         position_dim: Total position encoding dimension (default: 64)
         local_context_dim: Dimension of local context (default: 256)
         attention_context_dim: Dimension of attention context (default: 128)
+        structure_feature_dim: Dimension of structure features (default: 64)
         fusion_hidden_dims: Hidden dims for fusion MLP (default: [512, 384])
         output_dim: Final edit embedding dimension (default: 256)
         window_size: Number of nucleotides on each side of edit (default: 10)
         dropout: Dropout probability (default: 0.1)
         max_seq_len: Maximum sequence length (default: 512)
+        use_structure: Whether to use structure features (default: False)
+        structure_predictor: Optional RNAplfold predictor for structure features
     """
 
     def __init__(
         self,
-        rnafm_embedder: nn.Module,
+        base_embedder: nn.Module,
         mutation_type_dim: int = 64,
         mutation_effect_dim: int = 256,
         position_dim: int = 64,
         local_context_dim: int = 256,
         attention_context_dim: int = 128,
+        structure_feature_dim: int = 64,
         fusion_hidden_dims: List[int] = None,
         output_dim: int = 256,
         window_size: int = 10,
         dropout: float = 0.1,
-        max_seq_len: int = 512
+        max_seq_len: int = 512,
+        use_structure: bool = False,
+        structure_predictor: Optional[nn.Module] = None
     ):
         super().__init__()
 
-        self.rnafm = rnafm_embedder
-        self.rnafm_dim = rnafm_embedder.embedding_dim  # 640 for RNA-FM
+        self.base_embedder = base_embedder
+        self.base_dim = base_embedder.embedding_dim
         self.window_size = window_size
         self.output_dim = output_dim
+        self.use_structure = use_structure
+        self.structure_predictor = structure_predictor
+
+        # Detect embedder type for token-level access
+        self._embedder_type = self._detect_embedder_type()
 
         if fusion_hidden_dims is None:
             fusion_hidden_dims = [512, 384]
@@ -127,11 +142,9 @@ class StructuredRNAEditEmbedder(nn.Module):
         # ========================================
         # 2. Mutation Effect (Δ token embedding)
         # ========================================
-        # Learned nucleotide embeddings that mimic pretrained token semantics
-        # We'll extract these from RNA-FM or learn them
-        self.nucleotide_embed = nn.Embedding(4, self.rnafm_dim)
+        self.nucleotide_embed = nn.Embedding(4, self.base_dim)
         self.mutation_effect_proj = nn.Sequential(
-            nn.Linear(self.rnafm_dim, mutation_effect_dim),
+            nn.Linear(self.base_dim, mutation_effect_dim),
             nn.LayerNorm(mutation_effect_dim),
             nn.ReLU()
         )
@@ -139,25 +152,18 @@ class StructuredRNAEditEmbedder(nn.Module):
         # ========================================
         # 3. Position Encoding
         # ========================================
-        # Sinusoidal (half of position_dim)
         sin_dim = position_dim // 2
         self.sinusoidal_pos = SinusoidalPositionalEncoding(sin_dim, max_seq_len)
-
-        # Learned (other half)
         learned_dim = position_dim - sin_dim
         self.learned_pos_embed = nn.Embedding(max_seq_len, learned_dim)
-
-        # Also encode relative position (pos / seq_len)
         self.relative_pos_proj = nn.Linear(1, position_dim // 4)
-
-        # Final position dimension
         self.position_dim = sin_dim + learned_dim + position_dim // 4
 
         # ========================================
         # 4. Local Context (window ±N around edit)
         # ========================================
         self.local_context_proj = nn.Sequential(
-            nn.Linear(self.rnafm_dim, local_context_dim),
+            nn.Linear(self.base_dim, local_context_dim),
             nn.LayerNorm(local_context_dim),
             nn.ReLU()
         )
@@ -166,24 +172,41 @@ class StructuredRNAEditEmbedder(nn.Module):
         # 5. Attention Context
         # ========================================
         self.attention_context_proj = nn.Sequential(
-            nn.Linear(self.rnafm_dim, attention_context_dim),
+            nn.Linear(self.base_dim, attention_context_dim),
             nn.LayerNorm(attention_context_dim),
             nn.ReLU()
         )
 
         # ========================================
-        # 6. Fusion MLP
+        # 6. Structure Features (Optional)
         # ========================================
-        # Calculate total input dimension
+        if use_structure:
+            self.structure_feature_dim = structure_feature_dim
+            # 7 raw features: Δ_pairing, Δ_accessibility, Δ_entropy, Δ_mfe,
+            # Δ_local_pairing, Δ_local_accessibility, local_pairing_std
+            self.structure_proj = nn.Sequential(
+                nn.Linear(7, 32),
+                nn.LayerNorm(32),
+                nn.ReLU(),
+                nn.Linear(32, structure_feature_dim),
+                nn.LayerNorm(structure_feature_dim),
+                nn.ReLU()
+            )
+        else:
+            self.structure_feature_dim = 0
+
+        # ========================================
+        # 7. Fusion MLP
+        # ========================================
         raw_dim = (
-            mutation_type_dim +      # mutation type
-            mutation_effect_dim +    # Δ token
-            self.position_dim +      # position (sin + learned + relative)
-            local_context_dim +      # local window
-            attention_context_dim    # attention context
+            mutation_type_dim +
+            mutation_effect_dim +
+            self.position_dim +
+            local_context_dim +
+            attention_context_dim +
+            self.structure_feature_dim
         )
 
-        # Build fusion MLP
         fusion_layers = []
         prev_dim = raw_dim
 
@@ -196,7 +219,6 @@ class StructuredRNAEditEmbedder(nn.Module):
             ])
             prev_dim = hidden_dim
 
-        # Final output layer (no dropout)
         fusion_layers.extend([
             nn.Linear(prev_dim, output_dim),
             nn.LayerNorm(output_dim),
@@ -205,66 +227,205 @@ class StructuredRNAEditEmbedder(nn.Module):
 
         self.fusion_mlp = nn.Sequential(*fusion_layers)
 
-        # Store dimensions for reference
+        # Store dimensions
         self._component_dims = {
             'mutation_type': mutation_type_dim,
             'mutation_effect': mutation_effect_dim,
             'position': self.position_dim,
             'local_context': local_context_dim,
             'attention_context': attention_context_dim,
+            'structure': self.structure_feature_dim,
             'raw_total': raw_dim,
             'output': output_dim
         }
 
-        # Initialize weights
         self._init_weights()
+
+    def _detect_embedder_type(self) -> str:
+        """Detect the type of base embedder."""
+        class_name = self.base_embedder.__class__.__name__
+        if 'RNAFM' in class_name:
+            return 'rnafm'
+        elif 'UTRLM' in class_name:
+            return 'utrlm'
+        elif 'RNABERT' in class_name:
+            return 'rnabert'
+        else:
+            return 'unknown'
 
     def _init_weights(self):
         """Initialize weights with reasonable defaults."""
-        # Initialize nucleotide embeddings to capture basic differences
-        # A, C, G, U have different chemical properties
         with torch.no_grad():
-            # Simple initialization - will be refined during training
             nn.init.xavier_uniform_(self.nucleotide_embed.weight)
             nn.init.xavier_uniform_(self.mutation_type_embed.weight)
+
+    def _get_token_embeddings(
+        self,
+        sequences: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get token-level embeddings and attention weights from base embedder.
+
+        Returns:
+            token_embeddings: [batch, seq_len, embed_dim]
+            attention_weights: [batch, seq_len, seq_len]
+        """
+        if self._embedder_type == 'rnafm':
+            return self._get_rnafm_token_embeddings(sequences)
+        elif self._embedder_type == 'utrlm':
+            return self._get_utrlm_token_embeddings(sequences)
+        elif self._embedder_type == 'rnabert':
+            return self._get_rnabert_token_embeddings(sequences)
+        else:
+            # Fallback: use sequence-level embedding replicated
+            return self._get_fallback_token_embeddings(sequences)
 
     def _get_rnafm_token_embeddings(
         self,
         sequences: List[str]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get RNA-FM token-level embeddings and attention weights.
-
-        Returns:
-            token_embeddings: [batch, seq_len, 640]
-            attention_weights: [batch, seq_len, seq_len] (averaged over heads/layers)
-        """
-        # Prepare data for RNA-FM
+        """Get RNA-FM token embeddings and attention weights."""
         data = [(f"seq_{i}", seq) for i, seq in enumerate(sequences)]
-        _, _, batch_tokens = self.rnafm.batch_converter(data)
-        batch_tokens = batch_tokens.to(next(self.rnafm.model.parameters()).device)
+        _, _, batch_tokens = self.base_embedder.batch_converter(data)
+        batch_tokens = batch_tokens.to(next(self.base_embedder.model.parameters()).device)
 
-        # Get embeddings with attention
         with torch.no_grad():
-            results = self.rnafm.model(batch_tokens, repr_layers=[12], need_head_weights=True)
-
-            # Token embeddings [batch, seq_len, 640]
+            results = self.base_embedder.model(batch_tokens, repr_layers=[12], need_head_weights=True)
             token_embeddings = results["representations"][12]
-
-            # Attention weights handling
-            # RNA-FM returns attentions as tensor [batch, layers, heads, seq, seq]
             attentions = results["attentions"]
 
             if isinstance(attentions, torch.Tensor):
-                # Shape: [batch, layers, heads, seq, seq]
-                # Select last layer and average over heads
-                attention_weights = attentions[:, -1, :, :, :].mean(dim=1)  # [batch, seq, seq]
+                attention_weights = attentions[:, -1, :, :, :].mean(dim=1)
             else:
-                # If it's a tuple/list of per-layer tensors
-                # Each element: [batch, heads, seq, seq]
-                attention_weights = attentions[-1].mean(dim=1)  # [batch, seq, seq]
+                attention_weights = attentions[-1].mean(dim=1)
 
         return token_embeddings, attention_weights
+
+    def _get_utrlm_token_embeddings(
+        self,
+        sequences: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get UTR-LM token embeddings and attention weights."""
+        with torch.no_grad():
+            # Get token-level embeddings
+            token_embeddings = self.base_embedder(sequences, return_all_tokens=True)
+
+            # Get attention weights if available
+            if hasattr(self.base_embedder, 'get_attention_weights'):
+                attention_weights = self.base_embedder.get_attention_weights(sequences)
+            else:
+                # Fallback: uniform attention
+                batch_size, seq_len, _ = token_embeddings.shape
+                device = token_embeddings.device
+                attention_weights = torch.ones(batch_size, seq_len, seq_len, device=device) / seq_len
+
+        return token_embeddings, attention_weights
+
+    def _get_rnabert_token_embeddings(
+        self,
+        sequences: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get RNABERT token embeddings and attention weights."""
+        from transformers import AutoTokenizer
+
+        sequences = [seq.upper().replace('T', 'U') for seq in sequences]
+        device = next(self.base_embedder.model.parameters()).device
+
+        inputs = self.base_embedder.tokenizer(
+            sequences,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.base_embedder._max_length
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.base_embedder.model(**inputs, output_attentions=True)
+            token_embeddings = outputs.last_hidden_state
+
+            # Average attention across heads and layers
+            if hasattr(outputs, 'attentions') and outputs.attentions is not None:
+                attention_weights = torch.stack(outputs.attentions).mean(dim=(0, 2))
+            else:
+                batch_size, seq_len, _ = token_embeddings.shape
+                attention_weights = torch.ones(batch_size, seq_len, seq_len, device=device) / seq_len
+
+        return token_embeddings, attention_weights
+
+    def _get_fallback_token_embeddings(
+        self,
+        sequences: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fallback for embedders without token-level access."""
+        device = next(self.parameters()).device
+        batch_size = len(sequences)
+        max_len = max(len(s) for s in sequences)
+
+        # Get sequence-level embeddings and replicate
+        seq_embs = self.base_embedder.encode(sequences)
+        if isinstance(seq_embs, np.ndarray):
+            seq_embs = torch.from_numpy(seq_embs).to(device)
+
+        # Replicate to token level
+        token_embeddings = seq_embs.unsqueeze(1).expand(-1, max_len + 2, -1)
+
+        # Uniform attention
+        attention_weights = torch.ones(batch_size, max_len + 2, max_len + 2, device=device) / (max_len + 2)
+
+        return token_embeddings, attention_weights
+
+    def _compute_structure_features(
+        self,
+        sequences: List[str],
+        edit_positions: torch.Tensor,
+        edit_from: List[str],
+        edit_to: List[str]
+    ) -> torch.Tensor:
+        """
+        Compute Δ-structure features using structure predictor.
+
+        Returns:
+            Structure features tensor of shape [batch, 7]
+        """
+        if not self.use_structure or self.structure_predictor is None:
+            return torch.zeros(len(sequences), 7)
+
+        device = edit_positions.device
+        features = []
+
+        for i, seq in enumerate(sequences):
+            pos = edit_positions[i].item()
+            nuc_from = edit_from[i].upper()
+            nuc_to = edit_to[i].upper()
+
+            # Create mutated sequence
+            seq_list = list(seq)
+            if pos < len(seq_list):
+                seq_list[pos] = nuc_to
+            seq_after = ''.join(seq_list)
+
+            try:
+                delta = self.structure_predictor.compute_delta_structure(
+                    seq, seq_after, pos
+                )
+                feat = [
+                    delta['delta_pairing'][pos] if pos < len(delta['delta_pairing']) else 0.0,
+                    delta['delta_accessibility'][pos] if pos < len(delta['delta_accessibility']) else 0.0,
+                    delta['delta_entropy'][pos] if pos < len(delta['delta_entropy']) else 0.0,
+                    delta['delta_mfe'],
+                    delta['delta_local_pairing'],
+                    np.mean(delta['delta_accessibility'][max(0, pos-self.window_size):pos+self.window_size+1])
+                    if len(delta['delta_accessibility']) > 0 else 0.0,
+                    np.std(delta['delta_pairing'][max(0, pos-self.window_size):pos+self.window_size+1])
+                    if len(delta['delta_pairing']) > 0 else 0.0,
+                ]
+            except Exception:
+                feat = [0.0] * 7
+
+            features.append(feat)
+
+        return torch.tensor(features, dtype=torch.float32, device=device)
 
     def forward(
         self,
@@ -303,14 +464,12 @@ class StructuredRNAEditEmbedder(nn.Module):
 
         # Normalize sequences (T -> U)
         sequences = [seq.upper().replace('T', 'U') for seq in sequences]
-
-        # Get sequence lengths
         seq_lengths = torch.tensor([len(s) for s in sequences], device=device, dtype=torch.float)
 
         # ========================================
-        # Get RNA-FM embeddings
+        # Get token embeddings
         # ========================================
-        token_embeddings, attention_weights = self._get_rnafm_token_embeddings(sequences)
+        token_embeddings, attention_weights = self._get_token_embeddings(sequences)
         token_embeddings = token_embeddings.to(device)
         attention_weights = attention_weights.to(device)
 
@@ -321,94 +480,78 @@ class StructuredRNAEditEmbedder(nn.Module):
             MUTATION_TYPES.get((f.upper(), t.upper()), 0)
             for f, t in zip(edit_from, edit_to)
         ], device=device)
-
-        mutation_type_emb = self.mutation_type_embed(mutation_type_ids)  # [batch, 64]
+        mutation_type_emb = self.mutation_type_embed(mutation_type_ids)
 
         # ========================================
         # 2. Mutation Effect (Δ token)
         # ========================================
         from_ids = torch.tensor([NUC_TO_IDX[f.upper()] for f in edit_from], device=device)
         to_ids = torch.tensor([NUC_TO_IDX[t.upper()] for t in edit_to], device=device)
-
-        from_emb = self.nucleotide_embed(from_ids)  # [batch, 640]
-        to_emb = self.nucleotide_embed(to_ids)      # [batch, 640]
-        delta_token = to_emb - from_emb             # [batch, 640]
-
-        mutation_effect_emb = self.mutation_effect_proj(delta_token)  # [batch, 256]
+        delta_token = self.nucleotide_embed(to_ids) - self.nucleotide_embed(from_ids)
+        mutation_effect_emb = self.mutation_effect_proj(delta_token)
 
         # ========================================
         # 3. Position Encoding
         # ========================================
-        # Sinusoidal encoding
-        sin_pos = self.sinusoidal_pos(edit_positions)  # [batch, sin_dim]
-
-        # Learned position embedding
-        learned_pos = self.learned_pos_embed(edit_positions)  # [batch, learned_dim]
-
-        # Relative position (pos / seq_len)
-        relative_pos = (edit_positions.float() / seq_lengths).unsqueeze(-1)  # [batch, 1]
-        relative_pos_emb = self.relative_pos_proj(relative_pos)  # [batch, pos_dim//4]
-
-        position_emb = torch.cat([sin_pos, learned_pos, relative_pos_emb], dim=-1)  # [batch, position_dim]
+        sin_pos = self.sinusoidal_pos(edit_positions)
+        learned_pos = self.learned_pos_embed(edit_positions)
+        relative_pos = (edit_positions.float() / seq_lengths).unsqueeze(-1)
+        relative_pos_emb = self.relative_pos_proj(relative_pos)
+        position_emb = torch.cat([sin_pos, learned_pos, relative_pos_emb], dim=-1)
 
         # ========================================
         # 4. Local Context (window around edit)
         # ========================================
-        # Note: RNA-FM adds special tokens, so actual sequence starts at index 1
         local_contexts = []
-
         for i in range(batch_size):
             pos = edit_positions[i].item()
             seq_len = int(seq_lengths[i].item())
-
-            # Calculate window bounds (accounting for RNA-FM's +1 offset for special token)
+            # Account for special tokens (CLS at 0)
             start = max(1, pos + 1 - self.window_size)
             end = min(seq_len + 1, pos + 1 + self.window_size + 1)
-
-            # Extract window tokens
-            window = token_embeddings[i, start:end, :]  # [window_len, 640]
-
-            # Mean pool
-            local_ctx = window.mean(dim=0)  # [640]
-            local_contexts.append(local_ctx)
-
-        local_context = torch.stack(local_contexts)  # [batch, 640]
-        local_context_emb = self.local_context_proj(local_context)  # [batch, 256]
+            window = token_embeddings[i, start:end, :]
+            local_contexts.append(window.mean(dim=0))
+        local_context = torch.stack(local_contexts)
+        local_context_emb = self.local_context_proj(local_context)
 
         # ========================================
         # 5. Attention Context
         # ========================================
-        # Get attention weights TO the edit position from all other positions
         attention_contexts = []
-
         for i in range(batch_size):
             pos = edit_positions[i].item()
             seq_len = int(seq_lengths[i].item())
-
-            # Attention from all positions to edit position (+1 for special token)
-            attn_to_edit = attention_weights[i, :seq_len+2, pos+1]  # [seq_len+2]
-
-            # Attention-weighted sum of tokens
+            attn_to_edit = attention_weights[i, :seq_len+2, pos+1]
             weighted_tokens = token_embeddings[i, :seq_len+2, :] * attn_to_edit.unsqueeze(-1)
-            attn_ctx = weighted_tokens.sum(dim=0)  # [640]
-            attention_contexts.append(attn_ctx)
-
-        attention_context = torch.stack(attention_contexts)  # [batch, 640]
-        attention_context_emb = self.attention_context_proj(attention_context)  # [batch, 128]
+            attention_contexts.append(weighted_tokens.sum(dim=0))
+        attention_context = torch.stack(attention_contexts)
+        attention_context_emb = self.attention_context_proj(attention_context)
 
         # ========================================
-        # 6. Concatenate and Fuse
+        # 6. Concatenate components
         # ========================================
-        raw_embedding = torch.cat([
-            mutation_type_emb,      # [batch, 64]
-            mutation_effect_emb,    # [batch, 256]
-            position_emb,           # [batch, ~80]
-            local_context_emb,      # [batch, 256]
-            attention_context_emb   # [batch, 128]
-        ], dim=-1)
+        components = [
+            mutation_type_emb,
+            mutation_effect_emb,
+            position_emb,
+            local_context_emb,
+            attention_context_emb
+        ]
 
-        # Fusion MLP
-        edit_embedding = self.fusion_mlp(raw_embedding)  # [batch, output_dim]
+        # Add structure features if enabled
+        if self.use_structure and self.structure_predictor is not None:
+            structure_raw = self._compute_structure_features(
+                sequences, edit_positions, edit_from, edit_to
+            )
+            structure_emb = self.structure_proj(structure_raw)
+            components.append(structure_emb)
+
+        raw_embedding = torch.cat(components, dim=-1)
+
+        # ========================================
+        # 7. Fusion MLP
+        # ========================================
+        edit_embedding = self.fusion_mlp(raw_embedding)
 
         return edit_embedding
 
@@ -432,19 +575,8 @@ class StructuredRNAEditEmbedder(nn.Module):
         """
         Get individual component embeddings (for analysis/debugging).
 
-        Returns dict with:
-            - mutation_type: [batch, 64]
-            - mutation_effect: [batch, 256]
-            - position: [batch, ~80]
-            - local_context: [batch, 256]
-            - attention_context: [batch, 128]
-            - raw: [batch, raw_dim] (concatenated)
-            - fused: [batch, output_dim] (final)
+        Returns dict with each component embedding.
         """
-        # This is a debugging method - run forward pass but capture intermediates
-        # For production, use forward() directly
-
-        # Handle single inputs
         if isinstance(sequences, str):
             sequences = [sequences]
             edit_positions = [edit_positions]
@@ -460,31 +592,28 @@ class StructuredRNAEditEmbedder(nn.Module):
         sequences = [seq.upper().replace('T', 'U') for seq in sequences]
         seq_lengths = torch.tensor([len(s) for s in sequences], device=device, dtype=torch.float)
 
-        token_embeddings, attention_weights = self._get_rnafm_token_embeddings(sequences)
+        token_embeddings, attention_weights = self._get_token_embeddings(sequences)
         token_embeddings = token_embeddings.to(device)
         attention_weights = attention_weights.to(device)
 
-        # Component 1: Mutation type
+        # Compute each component
         mutation_type_ids = torch.tensor([
             MUTATION_TYPES.get((f.upper(), t.upper()), 0)
             for f, t in zip(edit_from, edit_to)
         ], device=device)
         mutation_type_emb = self.mutation_type_embed(mutation_type_ids)
 
-        # Component 2: Mutation effect
         from_ids = torch.tensor([NUC_TO_IDX[f.upper()] for f in edit_from], device=device)
         to_ids = torch.tensor([NUC_TO_IDX[t.upper()] for t in edit_to], device=device)
         delta_token = self.nucleotide_embed(to_ids) - self.nucleotide_embed(from_ids)
         mutation_effect_emb = self.mutation_effect_proj(delta_token)
 
-        # Component 3: Position
         sin_pos = self.sinusoidal_pos(edit_positions)
         learned_pos = self.learned_pos_embed(edit_positions)
         relative_pos = (edit_positions.float() / seq_lengths).unsqueeze(-1)
         relative_pos_emb = self.relative_pos_proj(relative_pos)
         position_emb = torch.cat([sin_pos, learned_pos, relative_pos_emb], dim=-1)
 
-        # Component 4: Local context
         local_contexts = []
         for i in range(batch_size):
             pos = edit_positions[i].item()
@@ -496,7 +625,6 @@ class StructuredRNAEditEmbedder(nn.Module):
         local_context = torch.stack(local_contexts)
         local_context_emb = self.local_context_proj(local_context)
 
-        # Component 5: Attention context
         attention_contexts = []
         for i in range(batch_size):
             pos = edit_positions[i].item()
@@ -507,24 +635,124 @@ class StructuredRNAEditEmbedder(nn.Module):
         attention_context = torch.stack(attention_contexts)
         attention_context_emb = self.attention_context_proj(attention_context)
 
-        # Raw concatenation
-        raw_embedding = torch.cat([
+        components = [
             mutation_type_emb,
             mutation_effect_emb,
             position_emb,
             local_context_emb,
             attention_context_emb
-        ], dim=-1)
+        ]
 
-        # Fused
-        fused_embedding = self.fusion_mlp(raw_embedding)
-
-        return {
+        result = {
             'mutation_type': mutation_type_emb,
             'mutation_effect': mutation_effect_emb,
             'position': position_emb,
             'local_context': local_context_emb,
             'attention_context': attention_context_emb,
-            'raw': raw_embedding,
-            'fused': fused_embedding
         }
+
+        if self.use_structure and self.structure_predictor is not None:
+            structure_raw = self._compute_structure_features(
+                sequences, edit_positions, edit_from, edit_to
+            )
+            structure_emb = self.structure_proj(structure_raw)
+            components.append(structure_emb)
+            result['structure'] = structure_emb
+
+        raw_embedding = torch.cat(components, dim=-1)
+        fused_embedding = self.fusion_mlp(raw_embedding)
+
+        result['raw'] = raw_embedding
+        result['fused'] = fused_embedding
+
+        return result
+
+
+# =============================================================================
+# Factory functions
+# =============================================================================
+
+def create_rnafm_structured_embedder(
+    trainable: bool = False,
+    use_structure: bool = False,
+    **kwargs
+) -> StructuredRNAEditEmbedder:
+    """
+    Create StructuredRNAEditEmbedder with RNA-FM as base.
+
+    Args:
+        trainable: Whether RNA-FM should be trainable
+        use_structure: Whether to use structure features
+        **kwargs: Additional arguments for StructuredRNAEditEmbedder
+
+    Returns:
+        Configured StructuredRNAEditEmbedder
+    """
+    from .rnafm import RNAFMEmbedder
+
+    rnafm = RNAFMEmbedder(trainable=trainable)
+
+    structure_predictor = None
+    if use_structure:
+        try:
+            from .rnaplfold import RNAplfoldPredictor
+            structure_predictor = RNAplfoldPredictor()
+            if not structure_predictor.is_available:
+                print("Warning: ViennaRNA not available, structure features disabled")
+                structure_predictor = None
+                use_structure = False
+        except ImportError:
+            print("Warning: Could not import RNAplfold, structure features disabled")
+            use_structure = False
+
+    return StructuredRNAEditEmbedder(
+        base_embedder=rnafm,
+        use_structure=use_structure,
+        structure_predictor=structure_predictor,
+        **kwargs
+    )
+
+
+def create_utrlm_structured_embedder(
+    model_name: str = "multimolecule/utrlm-te_el",
+    trainable: bool = False,
+    use_structure: bool = False,
+    **kwargs
+) -> StructuredRNAEditEmbedder:
+    """
+    Create StructuredRNAEditEmbedder with UTR-LM as base.
+
+    This provides structured edit embeddings using UTR-LM (5' UTR specific model).
+
+    Args:
+        model_name: HuggingFace model ID for UTR-LM
+        trainable: Whether UTR-LM should be trainable
+        use_structure: Whether to use structure features
+        **kwargs: Additional arguments for StructuredRNAEditEmbedder
+
+    Returns:
+        Configured StructuredRNAEditEmbedder
+    """
+    from .utrlm import UTRLMEmbedder
+
+    utrlm = UTRLMEmbedder(model_path=model_name, trainable=trainable)
+
+    structure_predictor = None
+    if use_structure:
+        try:
+            from .rnaplfold import RNAplfoldPredictor
+            structure_predictor = RNAplfoldPredictor()
+            if not structure_predictor.is_available:
+                print("Warning: ViennaRNA not available, structure features disabled")
+                structure_predictor = None
+                use_structure = False
+        except ImportError:
+            print("Warning: Could not import RNAplfold, structure features disabled")
+            use_structure = False
+
+    return StructuredRNAEditEmbedder(
+        base_embedder=utrlm,
+        use_structure=use_structure,
+        structure_predictor=structure_predictor,
+        **kwargs
+    )

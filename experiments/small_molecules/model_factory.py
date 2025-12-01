@@ -7,6 +7,17 @@ from src.models import PropertyPredictor, EditEffectPredictor, StructuredEditEff
 from src.models.predictors import TrainablePropertyPredictor, TrainableEditEffectPredictor
 from src.embedding.small_molecule import ChemBERTaEmbedder, ChemPropEmbedder, EditEmbedder
 
+# Optional imports for new embedders
+try:
+    from src.embedding.small_molecule import GraphormerEmbedder
+except ImportError:
+    GraphormerEmbedder = None
+
+try:
+    from src.embedding.small_molecule import MolFMEmbedder
+except ImportError:
+    MolFMEmbedder = None
+
 
 def is_embedder_trainable(embedder) -> bool:
     """Check if an embedder supports trainable mode."""
@@ -30,6 +41,20 @@ def create_embedder(embedder_type: str, trainable_encoder: bool = False, encoder
 
     if embedder_type == 'chemberta':
         return ChemBERTaEmbedder(trainable=trainable_encoder, device=encoder_device)
+    elif embedder_type == 'chemberta2' or embedder_type == 'chemberta2-mlm':
+        # ChemBERTa-2 77M MLM (recommended)
+        return ChemBERTaEmbedder(
+            model_name='chemberta2-mlm',
+            trainable=trainable_encoder,
+            device=encoder_device
+        )
+    elif embedder_type == 'chemberta2-mtr':
+        # ChemBERTa-2 77M MTR (with property prediction pretraining)
+        return ChemBERTaEmbedder(
+            model_name='chemberta2-mtr',
+            trainable=trainable_encoder,
+            device=encoder_device
+        )
     elif embedder_type == 'chemprop':
         # Default: Morgan fingerprints (CPU-based, 2048-dim)
         return ChemPropEmbedder()
@@ -46,6 +71,48 @@ def create_embedder(embedder_type: str, trainable_encoder: bool = False, encoder
     elif embedder_type == 'chemprop_rdkit':
         # RDKit 2D descriptors (CPU-based, 217-dim)
         return ChemPropEmbedder(featurizer_type='rdkit2d')
+    elif embedder_type == 'graphormer':
+        # Microsoft Graphormer (graph transformer)
+        if GraphormerEmbedder is None:
+            raise ImportError(
+                "Graphormer requires transformers library. "
+                "Install with: pip install transformers"
+            )
+        return GraphormerEmbedder(
+            trainable=trainable_encoder,
+            device=encoder_device,
+            backend='transformers'
+        )
+    elif embedder_type == 'molfm':
+        # MolFM multimodal foundation model
+        if MolFMEmbedder is None:
+            raise ImportError(
+                "MolFM requires transformers library. "
+                "Install with: pip install transformers"
+            )
+        return MolFMEmbedder(
+            trainable=trainable_encoder,
+            device=encoder_device,
+            modality='multimodal'
+        )
+    elif embedder_type == 'molfm-sequence':
+        # MolFM sequence-only (uses SMILES)
+        if MolFMEmbedder is None:
+            raise ImportError("MolFM requires transformers library.")
+        return MolFMEmbedder(
+            trainable=trainable_encoder,
+            device=encoder_device,
+            modality='sequence'
+        )
+    elif embedder_type == 'molfm-graph':
+        # MolFM graph-only
+        if MolFMEmbedder is None:
+            raise ImportError("MolFM requires transformers library.")
+        return MolFMEmbedder(
+            trainable=trainable_encoder,
+            device=encoder_device,
+            modality='graph'
+        )
     else:
         raise ValueError(f"Unknown embedder type: {embedder_type}")
 
@@ -170,7 +237,7 @@ def create_models(config, train_data: Dict, embedder=None) -> Dict:
                     head_hidden_dims=method_config.get('head_hidden_dims'),
                     dropout=method_config.get('dropout', 0.2),
                     learning_rate=method_config.get('lr', 0.001),
-                    encoder_learning_rate=encoder_lr,
+                    gnn_learning_rate=encoder_lr,  # EditEffectPredictor still uses gnn_learning_rate
                     batch_size=method_config.get('batch_size', 32),
                     max_epochs=method_config.get('max_epochs', method_config.get('epochs', 50)),
                     trainable_edit_embeddings=method_config.get('trainable_edit_embeddings', True),

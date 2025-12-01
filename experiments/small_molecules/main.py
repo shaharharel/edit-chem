@@ -61,6 +61,115 @@ def main():
             # Note: edit_framework_structured requires 'chemprop_dmpnn'
             methods=[
                 {
+                    'name': 'Structured Edit - D-MPNN',
+                    'type': 'edit_framework_structured',
+                    'embedder_type': 'chemprop_dmpnn',
+                    'trainable_encoder': False,
+                    'encoder_device': 'auto',
+                    'edit_mlp_dims': [512, 512, 300],  # Edit embedding MLP
+                    'delta_mlp_dims': [512, 256, 128],  # Delta prediction MLP
+                    'k_hop_env': 2,  # K-hop neighborhood for local environment
+                    'use_local_delta': True,  # Use local delta from k-hop env
+                    'use_rdkit_descriptors': True,  # Include RDKit fragment descriptors
+                    'dropout': 0.1,
+                    'lr': 0.001,
+                    'encoder_lr': 1e-5,
+                    'batch_size': 32,
+                    'max_epochs': 2
+                },
+                {
+                    'name': 'Structured Edit - D-MPNN Trainable',
+                    'type': 'edit_framework_structured',
+                    'embedder_type': 'chemprop_dmpnn',
+                    'trainable_encoder': True,
+                    'encoder_device': 'auto',
+                    'edit_mlp_dims': [512, 512, 300],
+                    'delta_mlp_dims': [512, 256, 128],
+                    'k_hop_env': 2,
+                    'use_local_delta': True,
+                    'use_rdkit_descriptors': True,
+                    'dropout': 0.1,
+                    'lr': 0.001,
+                    'encoder_lr': 1e-5,
+                    'batch_size': 128,
+                    'max_epochs': 2
+                },
+            ],
+
+            metrics=['mae', 'rmse', 'r2', 'pearson_r', 'spearman_r'],
+
+            output_dir=f'results/{splitter_type}',
+
+            additional_test_files={},
+
+            include_cluster_analysis=True,
+            n_clusters=4,
+
+            include_edit_embedding_comparison=True
+        )
+
+        results, report_path = run_experiment(config)
+
+        print(f"\n{'='*80}")
+        print(f"Experiment '{config.experiment_name}' completed successfully!")
+        print(f"Report saved to: {report_path}")
+        print(f"{'='*80}\n")
+
+        # Free memory after each splitter to avoid accumulation
+        del results, report_path, config
+        gc.collect()
+        print(f"Memory freed after {splitter_type} splitter\n")
+
+    print(f"\n{'='*80}")
+    print("ALL EXPERIMENTS COMPLETED!")
+    print(f"{'='*80}")
+    print("\nResults directories:")
+    for splitter_type in splitters:
+        print(f"  - experiments/small_molecules/results/{splitter_type}/")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    main()
+    '''
+                # Structured Edit Framework - requires MMPDB data format
+                # Uses atom-level MMP information: removed_atoms_A, added_atoms_B, attach_atoms_A, mapped_pairs
+                # Data file must be changed to mmpdb format (e.g., chembl_pairs_mmpdb.csv)
+                {
+                    'name': 'Structured Edit - D-MPNN',
+                    'type': 'edit_framework_structured',
+                    'embedder_type': 'chemprop_dmpnn',
+                    'trainable_encoder': False,
+                    'encoder_device': 'auto',
+                    'edit_mlp_dims': [512, 512, 300],  # Edit embedding MLP
+                    'delta_mlp_dims': [512, 256, 128],  # Delta prediction MLP
+                    'k_hop_env': 2,  # K-hop neighborhood for local environment
+                    'use_local_delta': True,  # Use local delta from k-hop env
+                    'use_rdkit_descriptors': True,  # Include RDKit fragment descriptors
+                    'dropout': 0.1,
+                    'lr': 0.001,
+                    'encoder_lr': 1e-5,
+                    'batch_size': 32,
+                    'max_epochs': 2
+                },
+                {
+                    'name': 'Structured Edit - D-MPNN Trainable',
+                    'type': 'edit_framework_structured',
+                    'embedder_type': 'chemprop_dmpnn',
+                    'trainable_encoder': True,
+                    'encoder_device': 'auto',
+                    'edit_mlp_dims': [512, 512, 300],
+                    'delta_mlp_dims': [512, 256, 128],
+                    'k_hop_env': 2,
+                    'use_local_delta': True,
+                    'use_rdkit_descriptors': True,
+                    'dropout': 0.1,
+                    'lr': 0.001,
+                    'encoder_lr': 1e-5,
+                    'batch_size': 128,
+                    'max_epochs': 2
+                },
+                                {
                     'name': 'Edit Framework - D-MPNN',
                     'type': 'edit_framework',
                     'embedder_type': 'chemprop_dmpnn',
@@ -141,81 +250,6 @@ def main():
                     'head_hidden_dims': [256, 128],
                     'dropout': 0.1,
                     'lr': 0.001,
-                    'batch_size': 128,
-                    'max_epochs': 2
-                }
-            ],
-
-            metrics=['mae', 'rmse', 'r2', 'pearson_r', 'spearman_r'],
-
-            output_dir=f'results/{splitter_type}',
-
-            additional_test_files={},
-
-            include_cluster_analysis=True,
-            n_clusters=4,
-
-            include_edit_embedding_comparison=True
-        )
-
-        results, report_path = run_experiment(config)
-
-        print(f"\n{'='*80}")
-        print(f"Experiment '{config.experiment_name}' completed successfully!")
-        print(f"Report saved to: {report_path}")
-        print(f"{'='*80}\n")
-
-        # Free memory after each splitter to avoid accumulation
-        del results, report_path, config
-        gc.collect()
-        print(f"Memory freed after {splitter_type} splitter\n")
-
-    print(f"\n{'='*80}")
-    print("ALL EXPERIMENTS COMPLETED!")
-    print(f"{'='*80}")
-    print("\nResults directories:")
-    for splitter_type in splitters:
-        print(f"  - experiments/small_molecules/results/{splitter_type}/")
-    print(f"{'='*80}\n")
-
-
-if __name__ == "__main__":
-    main()
-    '''
-                # Structured Edit Framework - requires MMPDB data format
-                # Uses atom-level MMP information: removed_atoms_A, added_atoms_B, attach_atoms_A, mapped_pairs
-                # Data file must be changed to mmpdb format (e.g., chembl_pairs_mmpdb.csv)
-                {
-                    'name': 'Structured Edit - D-MPNN',
-                    'type': 'edit_framework_structured',
-                    'embedder_type': 'chemprop_dmpnn',
-                    'trainable_encoder': False,
-                    'encoder_device': 'auto',
-                    'edit_mlp_dims': [512, 512, 300],  # Edit embedding MLP
-                    'delta_mlp_dims': [512, 256, 128],  # Delta prediction MLP
-                    'k_hop_env': 2,  # K-hop neighborhood for local environment
-                    'use_local_delta': True,  # Use local delta from k-hop env
-                    'use_rdkit_descriptors': True,  # Include RDKit fragment descriptors
-                    'dropout': 0.1,
-                    'lr': 0.001,
-                    'encoder_lr': 1e-5,
-                    'batch_size': 32,
-                    'max_epochs': 2
-                },
-                {
-                    'name': 'Structured Edit - D-MPNN Trainable',
-                    'type': 'edit_framework_structured',
-                    'embedder_type': 'chemprop_dmpnn',
-                    'trainable_encoder': True,
-                    'encoder_device': 'auto',
-                    'edit_mlp_dims': [512, 512, 300],
-                    'delta_mlp_dims': [512, 256, 128],
-                    'k_hop_env': 2,
-                    'use_local_delta': True,
-                    'use_rdkit_descriptors': True,
-                    'dropout': 0.1,
-                    'lr': 0.001,
-                    'encoder_lr': 1e-5,
                     'batch_size': 128,
                     'max_epochs': 2
                 }

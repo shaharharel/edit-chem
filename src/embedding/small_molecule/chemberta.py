@@ -2,11 +2,20 @@
 ChemBERTa-based molecule embeddings.
 
 Uses transformer models pre-trained on SMILES:
-- ChemBERTa (seyonec/ChemBERTa-zinc-base-v1)
+- ChemBERTa (original: seyonec/ChemBERTa-zinc-base-v1)
+- ChemBERTa-2 77M MLM (DeepChem/ChemBERTa-77M-MLM) - recommended
+- ChemBERTa-2 77M MTR (DeepChem/ChemBERTa-77M-MTR)
 - MolBERT
-- SMILES-BERT
+
+ChemBERTa-2 is trained on 77M compounds from PubChem using either:
+- MLM (Masked Language Modeling) - better for general embeddings
+- MTR (Multi-Task Regression) - includes property prediction pretraining
 
 Supports both frozen (inference-only) and trainable modes for end-to-end learning.
+
+References:
+- ChemBERTa-2: https://arxiv.org/abs/2209.01712
+- HuggingFace: https://huggingface.co/DeepChem/ChemBERTa-77M-MLM
 """
 
 import numpy as np
@@ -19,13 +28,18 @@ from .base import MoleculeEmbedder
 
 class ChemBERTaEmbedder(nn.Module, MoleculeEmbedder):
     """
-    ChemBERTa-based molecule embedder.
+    ChemBERTa/ChemBERTa-2 based molecule embedder.
 
     Uses transformer models trained on SMILES strings.
     Supports both frozen and trainable modes for end-to-end learning.
 
     Args:
-        model_name: HuggingFace model name or path
+        model_name: Model name or HuggingFace path. Options:
+            - 'chemberta2-mlm' (recommended): ChemBERTa-2 77M MLM
+            - 'chemberta2-mtr': ChemBERTa-2 77M MTR
+            - 'chemberta': Original ChemBERTa-zinc-base-v1
+            - 'chemberta-large': Original ChemBERTa-zinc-large-v1
+            - Or any HuggingFace model path
         pooling: Pooling strategy ('mean', 'cls', 'max')
         device: Device to run on ('cuda' or 'cpu')
         batch_size: Batch size for encoding multiple molecules
@@ -35,8 +49,14 @@ class ChemBERTaEmbedder(nn.Module, MoleculeEmbedder):
     """
 
     DEFAULT_MODELS = {
+        # ChemBERTa-2 models (recommended - 77M params, trained on 77M compounds)
+        'chemberta2-mlm': 'DeepChem/ChemBERTa-77M-MLM',
+        'chemberta2-mtr': 'DeepChem/ChemBERTa-77M-MTR',
+        'chemberta2': 'DeepChem/ChemBERTa-77M-MLM',  # Alias for MLM (recommended)
+        # Original ChemBERTa models
         'chemberta': 'seyonec/ChemBERTa-zinc-base-v1',
         'chemberta-large': 'seyonec/ChemBERTa-zinc-large-v1',
+        # Other models
         'molbert': 'Danhup/MolBERT',
     }
 
@@ -277,3 +297,30 @@ def chemberta_embedder(pooling: str = 'mean', device: Optional[str] = None) -> C
 def chemberta_large_embedder(pooling: str = 'mean', device: Optional[str] = None) -> ChemBERTaEmbedder:
     """Create ChemBERTa large embedder (better quality, slower)."""
     return ChemBERTaEmbedder(model_name='chemberta-large', pooling=pooling, device=device)
+
+
+def chemberta2_embedder(
+    pooling: str = 'mean',
+    device: Optional[str] = None,
+    trainable: bool = False,
+    variant: str = 'mlm'
+) -> ChemBERTaEmbedder:
+    """
+    Create ChemBERTa-2 embedder (recommended - 77M params, trained on 77M compounds).
+
+    Args:
+        pooling: Pooling strategy ('mean', 'cls', 'max')
+        device: Device to run on
+        trainable: Whether to enable gradient updates
+        variant: Model variant - 'mlm' (Masked LM, recommended) or 'mtr' (Multi-Task Regression)
+
+    Returns:
+        ChemBERTaEmbedder configured for ChemBERTa-2
+    """
+    model_name = f'chemberta2-{variant}'
+    return ChemBERTaEmbedder(
+        model_name=model_name,
+        pooling=pooling,
+        device=device,
+        trainable=trainable
+    )
