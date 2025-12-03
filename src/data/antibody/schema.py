@@ -42,7 +42,8 @@ class AbMutation:
         position: 0-indexed position in the sequence
         from_aa: Original amino acid (single letter)
         to_aa: Mutated amino acid (single letter)
-        imgt_position: Optional IMGT-numbered position
+        imgt_position: Optional IMGT-numbered position (e.g., 100 for "100A")
+        imgt_insertion: Optional IMGT insertion code (e.g., "A" for "100A")
         region: Optional CDR/FR region (e.g., 'CDR3', 'FR1')
     """
     chain: str
@@ -50,10 +51,20 @@ class AbMutation:
     from_aa: str
     to_aa: str
     imgt_position: Optional[int] = None
+    imgt_insertion: Optional[str] = None
     region: Optional[str] = None
 
     def __str__(self) -> str:
         return f"{self.chain}{self.from_aa}{self.position + 1}{self.to_aa}"
+
+    @property
+    def imgt_position_str(self) -> Optional[str]:
+        """Get full IMGT position string including insertion code (e.g., '100A')."""
+        if self.imgt_position is None:
+            return None
+        if self.imgt_insertion:
+            return f"{self.imgt_position}{self.imgt_insertion}"
+        return str(self.imgt_position)
 
     @classmethod
     def from_string(cls, mutation_str: str) -> 'AbMutation':
@@ -64,25 +75,78 @@ class AbMutation:
         - "HA50K" (chain H, A->K at position 50)
         - "H:A50K" (with colon separator)
         - "A50K" (assumes heavy chain)
+        - "HA100AK" (IMGT insertion code: position 100A)
+        - "YH100BC" (chain H, Y->C at IMGT position 100B)
+        - "PH100A" (chain H, P->A at position 100)
         """
-        mutation_str = mutation_str.strip()
+        import re
+        mutation_str = mutation_str.strip().upper()
 
-        # Parse chain
-        if mutation_str[0] in ['H', 'L', 'K'] and mutation_str[1] in 'ACDEFGHIKLMNPQRSTVWY':
-            chain = mutation_str[0]
-            rest = mutation_str[1:]
-        elif ':' in mutation_str:
+        chain = None
+        rest = mutation_str
+
+        # Handle explicit chain separator first (e.g., "H:A50K")
+        if ':' in mutation_str:
             chain, rest = mutation_str.split(':', 1)
         else:
-            chain = 'H'  # Default to heavy
-            rest = mutation_str
+            # Try different parsing strategies
+            # Strategy 1: No chain prefix (e.g., "A50K", "A100BK")
+            match1 = re.match(r'^([A-Z])(\d+)([A-Z]?)([A-Z])$', mutation_str)
 
-        # Parse from_aa, position, to_aa
-        from_aa = rest[0]
-        to_aa = rest[-1]
-        position = int(rest[1:-1]) - 1  # Convert to 0-indexed
+            # Strategy 2: With chain prefix (e.g., "HA50K", "YH100BC")
+            # Chain is second character, from_aa is first
+            match2 = re.match(r'^([A-Z])([HLK])(\d+)([A-Z]?)([A-Z])$', mutation_str)
 
-        return cls(chain=chain, position=position, from_aa=from_aa, to_aa=to_aa)
+            if match2:
+                # Format: from_aa + chain + position + insertion? + to_aa
+                # e.g., "YH100BC" = Y -> C at position 100B on chain H
+                from_aa = match2.group(1)
+                chain = match2.group(2)
+                position = int(match2.group(3)) - 1
+                insertion_code = match2.group(4) if match2.group(4) else None
+                to_aa = match2.group(5)
+            elif match1:
+                # Format: from_aa + position + insertion? + to_aa (no chain)
+                # e.g., "A50K", "A100BK"
+                from_aa = match1.group(1)
+                position = int(match1.group(2)) - 1
+                insertion_code = match1.group(3) if match1.group(3) else None
+                to_aa = match1.group(4)
+                chain = 'H'  # Default to heavy
+            else:
+                raise ValueError(f"Cannot parse mutation: {mutation_str}")
+
+            # Default chain to heavy if not specified
+            if chain is None:
+                chain = 'H'
+
+            return cls(
+                chain=chain,
+                position=position,
+                from_aa=from_aa,
+                to_aa=to_aa,
+                imgt_position=position + 1 if insertion_code else None,
+                imgt_insertion=insertion_code,
+            )
+
+        # Parse rest after colon separator
+        match = re.match(r'^([A-Z])(\d+)([A-Z]?)([A-Z])$', rest)
+        if not match:
+            raise ValueError(f"Cannot parse mutation: {mutation_str}")
+
+        from_aa = match.group(1)
+        position = int(match.group(2)) - 1
+        insertion_code = match.group(3) if match.group(3) else None
+        to_aa = match.group(4)
+
+        return cls(
+            chain=chain,
+            position=position,
+            from_aa=from_aa,
+            to_aa=to_aa,
+            imgt_position=position + 1 if insertion_code else None,
+            imgt_insertion=insertion_code,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -91,6 +155,7 @@ class AbMutation:
             'from_aa': self.from_aa,
             'to_aa': self.to_aa,
             'imgt_position': self.imgt_position,
+            'imgt_insertion': self.imgt_insertion,
             'region': self.region,
         }
 

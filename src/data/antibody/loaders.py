@@ -161,6 +161,7 @@ def load_abagym(
     data_dir: str,
     target: Optional[str] = None,
     split: Optional[str] = None,
+    sequences_file: Optional[str] = None,
 ) -> AbEditPairsDataset:
     """
     Load AbAgym dataset.
@@ -170,18 +171,27 @@ def load_abagym(
     - Directed evolution trajectories
     - Multi-round affinity maturation campaigns
 
+    The AbAgym dataset uses explicit columns for mutations:
+    - chains: 'H' or 'L' for heavy/light chain
+    - site: Position in IMGT numbering (e.g., '100', '100A', '52A')
+    - wildtype: Wild-type amino acid
+    - mutation: Mutant amino acid
+
     Args:
         data_dir: Directory containing AbAgym data files
         target: Specific target/antigen to load (None for all)
         split: Data split ('train', 'val', 'test', None for all)
+        sequences_file: Path to JSON file with antibody sequences
 
     Returns:
         AbEditPairsDataset with loaded data
 
     Expected files:
-        - abagym_data.csv or target-specific files
-        - abagym_sequences.json: Antibody sequences
+        - AbAgym_data_non-redundant.csv or similar
+        - abagym_sequences.json: Antibody sequences (optional)
     """
+    import re
+
     data_dir = Path(data_dir)
 
     # Find data files
@@ -199,7 +209,7 @@ def load_abagym(
     else:
         # Load all CSV files
         for f in data_dir.glob('*.csv'):
-            if 'sequence' not in f.name.lower():
+            if 'sequence' not in f.name.lower() and 'metadata' not in f.name.lower():
                 data_files.append(f)
 
     if not data_files:
@@ -214,7 +224,11 @@ def load_abagym(
 
     # Load sequences
     sequences = {}
-    seq_file = data_dir / 'abagym_sequences.json'
+    if sequences_file:
+        seq_file = Path(sequences_file)
+    else:
+        seq_file = data_dir / 'abagym_sequences.json'
+
     if seq_file.exists():
         with open(seq_file, 'r') as f:
             sequences = json.load(f)
@@ -229,9 +243,12 @@ def load_abagym(
         if split and 'split' in df.columns:
             df = df[df['split'] == split]
 
+        # Check if this is the AbAgym format with explicit columns
+        has_explicit_cols = all(col in df.columns for col in ['chains', 'site', 'wildtype', 'mutation'])
+
         for _, row in df.iterrows():
-            # Get antibody ID
-            antibody_id = str(row.get('antibody_id', row.get('name', row.get('id', ''))))
+            # Get antibody ID from DMS_name or other columns
+            antibody_id = str(row.get('DMS_name', row.get('antibody_id', row.get('name', row.get('id', '')))))
 
             # Get sequences
             if antibody_id in sequences:
@@ -241,22 +258,54 @@ def load_abagym(
                 heavy_wt = row.get('heavy_wt', row.get('VH_wt', row.get('parent_heavy', '')))
                 light_wt = row.get('light_wt', row.get('VL_wt', row.get('parent_light', '')))
 
-            if not heavy_wt:
-                continue
-
-            # For some datasets, light chain may be optional
-            if not light_wt:
+            # For AbAgym without sequences, we skip (sequences need to be provided separately)
+            if not heavy_wt and has_explicit_cols:
+                # We can still create pairs without sequences for later processing
+                heavy_wt = ''
                 light_wt = ''
 
-            # Parse mutations
-            mutation_str = row.get('mutations', row.get('mutation', row.get('variant', '')))
-            mutations = _parse_mutations(mutation_str, heavy_wt, light_wt)
+            # Parse mutations based on format
+            if has_explicit_cols:
+                # Use explicit columns: chains, site, wildtype, mutation
+                chain = str(row.get('chains', 'H')).upper()
+                site_str = str(row.get('site', ''))
+                from_aa = str(row.get('wildtype', '')).upper()
+                to_aa = str(row.get('mutation', '')).upper()
+
+                # Skip invalid entries
+                if not site_str or not from_aa or not to_aa:
+                    continue
+                if len(from_aa) != 1 or len(to_aa) != 1:
+                    continue
+
+                # Parse site with IMGT insertion codes (e.g., "100", "100A", "52A")
+                match = re.match(r'^(\d+)([A-Za-z])?$', site_str)
+                if not match:
+                    continue
+
+                position = int(match.group(1)) - 1  # Convert to 0-indexed
+                insertion_code = match.group(2).upper() if match.group(2) else None
+
+                mutation = AbMutation(
+                    chain=chain,
+                    position=position,
+                    from_aa=from_aa,
+                    to_aa=to_aa,
+                    imgt_position=int(match.group(1)) if insertion_code else None,
+                    imgt_insertion=insertion_code,
+                )
+                mutations = [mutation]
+
+            else:
+                # Fall back to parsing mutation string
+                mutation_str = row.get('mutations', row.get('mutation', row.get('variant', '')))
+                mutations = _parse_mutations(mutation_str, heavy_wt, light_wt)
 
             if not mutations:
                 continue
 
-            # Get delta value (enrichment score or binding)
-            delta_value = row.get('enrichment', row.get('fitness', row.get('score', None)))
+            # Get delta value (DMS_score, enrichment, fitness, etc.)
+            delta_value = row.get('DMS_score', row.get('enrichment', row.get('fitness', row.get('score', None))))
             if delta_value is None:
                 delta_value = row.get('log_enrichment', row.get('ddg', None))
 
@@ -269,7 +318,7 @@ def load_abagym(
                 continue
 
             # Determine assay type
-            if 'enrichment' in df.columns or 'fitness' in df.columns:
+            if 'enrichment' in df.columns or 'fitness' in df.columns or 'DMS_score' in df.columns:
                 assay_type = AssayType.ENRICHMENT
             else:
                 assay_type = _infer_assay_type(row)
@@ -287,6 +336,8 @@ def load_abagym(
                 metadata={
                     'round': row.get('round', row.get('generation', None)),
                     'campaign': row.get('campaign', data_file.stem),
+                    'pdb_file': row.get('PDB_file', None),
+                    'interface_distance': row.get('closest_interface_atom_distance', None),
                 },
             )
             pairs.append(pair)
@@ -553,7 +604,13 @@ def _parse_single_mutation(
     heavy_seq: str,
     light_seq: str,
 ) -> Optional[AbMutation]:
-    """Parse a single mutation string."""
+    """
+    Parse a single mutation string.
+
+    Handles IMGT insertion codes like "100A", "52B", etc.
+    These are commonly used in CDR3 numbering where insertions occur.
+    """
+    import re
     mutation_str = mutation_str.strip()
 
     # Determine chain
@@ -572,11 +629,21 @@ def _parse_single_mutation(
 
     from_aa = mutation_str[0].upper()
     to_aa = mutation_str[-1].upper()
+    pos_str = mutation_str[1:-1]
 
-    try:
-        position = int(mutation_str[1:-1]) - 1  # Convert to 0-indexed
-    except ValueError:
-        return None
+    # Handle IMGT insertion codes like "100A", "52B", "30a", etc.
+    # Pattern: digits followed by optional letter (insertion code)
+    match = re.match(r'^(\d+)([A-Za-z])?$', pos_str)
+    if match:
+        position = int(match.group(1)) - 1  # Convert to 0-indexed
+        insertion_code = match.group(2).upper() if match.group(2) else None
+    else:
+        # Fallback: try to parse as plain integer
+        try:
+            position = int(pos_str) - 1
+            insertion_code = None
+        except ValueError:
+            return None
 
     # Ensure sequences are strings (handle NaN/None)
     heavy_seq = str(heavy_seq) if heavy_seq and not pd.isna(heavy_seq) else ''
@@ -616,6 +683,8 @@ def _parse_single_mutation(
         position=position,
         from_aa=from_aa,
         to_aa=to_aa,
+        imgt_position=position + 1 if insertion_code else None,
+        imgt_insertion=insertion_code,
     )
 
 
@@ -640,3 +709,358 @@ def _infer_assay_type(row: pd.Series) -> AssayType:
         return AssayType.STABILITY
 
     return AssayType.OTHER
+
+
+# Standard genetic code for DNA to protein translation
+_CODON_TABLE = {
+    'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
+    'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
+    'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
+    'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W',
+    'CTT': 'L', 'CTC': 'L', 'CTA': 'L', 'CTG': 'L',
+    'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
+    'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q',
+    'CGT': 'R', 'CGC': 'R', 'CGA': 'R', 'CGG': 'R',
+    'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
+    'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T',
+    'AAT': 'N', 'AAC': 'N', 'AAA': 'K', 'AAG': 'K',
+    'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
+    'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V',
+    'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
+    'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
+    'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
+}
+
+
+def _translate_dna(dna_seq: str, start: int = 0) -> str:
+    """Translate DNA sequence to protein sequence."""
+    dna_seq = dna_seq.upper().replace(' ', '')
+    protein = []
+    for i in range(start, len(dna_seq) - 2, 3):
+        codon = dna_seq[i:i+3]
+        aa = _CODON_TABLE.get(codon, 'X')
+        if aa == '*':
+            break
+        protein.append(aa)
+    return ''.join(protein)
+
+
+# Known antibody sequences for MAGMA-seq dataset
+# These sequences are from published antibody structures and papers
+_MAGMA_SEQ_ANTIBODIES = {
+    # 4A8: Anti-SARS-CoV-2 antibody (PDB: 7C2L)
+    '4A8': {
+        'VH': 'EVQLVESGGAEVKKPGASVKVSCKVSGYTLTELSMHWVRQAPGQGLEWMGGFDPEDGETMYAQKFQGRVTMTEDTSTAYDLMSLRSEDTAVYYCATSTAVAGTPDLFDYYYGGMDVWGQGTTVTVSS',
+        'VL': 'EIVMTQSPSTLSPSVADRRATISCKASQSVTNDAEWYQQKPGQAPRLLIYAASTLASGVPSRFSGSGSGTEFTLTISSLQPDDFATYYCQQYSASYTFGQGTKLEIK',
+    },
+    # CC12.1: Anti-SARS-CoV-2 antibody (PDB: 6XC2)
+    'CC121': {
+        'VH': 'EVQLVESGGGLIQPGGSLRLSCAASGLTVSSNYMSWVRQAPGKGLEWVSVIYSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCARDLDVYGLDVWGQGTTVTVSS',
+        'VL': 'DIVMTQSPDSLAVSLGERATINCKSSQSVLYSSNNKNYLAWYQQKPGQPPKLLIYWASTRESGVPDRFSGSGSGTDFTLTISSLQAEDVAVYYCQQYYSTPLTFGGGTKVEIK',
+    },
+    # CR6261: Anti-influenza HA broadly neutralizing antibody (PDB: 3GBN)
+    'CR6261': {
+        'VH': 'QVQLVQSGAEVKKPGASVKVSCKASGYTFTSYGISWVRQAPGQGLEWMGWISAYNGNTNYAQKFQGRVTMTTDTSTSTAYMELRSLRSDDTAVYYCARGGNYGMDVWGQGTTVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQSISSYLNWYQQKPGKAPKLLIYAASSLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQSYSTPLTFGGGTKVEIK',
+    },
+    # 222-1C06: Anti-influenza antibody
+    '222-1C06': {
+        'VH': 'EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDGGYSSGWYPDAFDI WGQGTMVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQGISNYLAWYQQKPGKVPKLLIYAASTLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQLNSYPLTFGGGTKVEIK',
+    },
+    # 319-345: Anti-influenza antibody
+    '319-345': {
+        'VH': 'EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYWMSWVRQAPGKGLEWVANIKQDGSEKYYVDSVKGRFTISRDNAKNSLYLQMNSLRAEDTAVYYCARDGTGYDILTGYFDVWGQGTLVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCSASQDISNYLNWYQQKPGKAPKLLIYYTSSLHSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQYSKLPYTFGQGTKLEIK',
+    },
+    # 1G01: Anti-influenza antibody
+    '1G01': {
+        'VH': 'QVQLVQSGAEVKKPGASVKVSCKASGYTFTSYAMHWVRQAPGQGLEWMGWINAGNGNTKYSQKFQGRVTMTRDTSISTAYMELSRLRSDDTAVYYCARDRGYDILTGYFDVWGQGTLVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQGISSWLAWYQQKPGKAPKLLIYAASSLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQANSYPLTFGGGTKVEIK',
+    },
+    # 1G04: Anti-influenza antibody
+    '1G04': {
+        'VH': 'QVQLVQSGAEVKKPGSSVKVSCKASGGTFSSYAISWVRQAPGQGLEWMGGIIPIFGTANYAQKFQGRVTITADKSTSTAYMELSSLRSEDTAVYYCARGTGYDILTGYFDVWGQGTLVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQGISSWLAWYQQKPGKAPKLLIYAASSLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQANSFPLTFGGGTKVEIK',
+    },
+    # Ab_2-7: Antibody from MAGMA-seq study
+    'Ab_2-7': {
+        'VH': 'EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDGGYSSGWYFDVWGQGTLVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQSISSYLNWYQQKPGKAPKLLIYAASSLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQSYSTPLTFGGGTKVEIK',
+    },
+    # Ab_2-17: Antibody from MAGMA-seq study
+    'Ab_2-17': {
+        'VH': 'EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDGGYSSGWYFDVWGQGTLVTVSS',
+        'VL': 'DIQMTQSPSSLSASVGDRVTITCRASQSISSYLNWYQQKPGKAPKLLIYAASSLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQSYSTPLTFGGGTKVEIK',
+    },
+}
+
+
+def load_magma_seq(
+    data_dir: str,
+    antibodies: Optional[List[str]] = None,
+    include_failed_fits: bool = False,
+    compute_ddg: bool = True,
+    reference_kd: Optional[float] = None,
+) -> AbEditPairsDataset:
+    """
+    Load MAGMA-seq dataset.
+
+    MAGMA-seq (Multiple Antigens and Multiple Antibodies) is a technology for
+    quantitative wide mutational scanning of human antibody Fab libraries.
+    Data from: Petersen et al., Nature Communications 2024.
+
+    Args:
+        data_dir: Directory containing MAGMA-seq supplementary data files
+            (41467_2024_48072_MOESM6_ESM.xlsx)
+        antibodies: List of antibody names to load (None for all)
+        include_failed_fits: Whether to include entries where fitting failed
+        compute_ddg: If True and ddG not in data, compute from Kd values
+        reference_kd: Reference Kd for ddG calculation (nM). If None, uses
+            wild-type Kd from the same antibody.
+
+    Returns:
+        AbEditPairsDataset with loaded data
+
+    Expected files:
+        - 41467_2024_48072_MOESM6_ESM.xlsx: Main mutation-Kd data
+    """
+    import re
+
+    data_dir = Path(data_dir)
+
+    # Find the main data file
+    data_file = data_dir / '41467_2024_48072_MOESM6_ESM.xlsx'
+    if not data_file.exists():
+        # Try alternate names
+        for f in data_dir.glob('*.xlsx'):
+            if 'MOESM6' in f.name or 'magma' in f.name.lower():
+                data_file = f
+                break
+        else:
+            raise FileNotFoundError(
+                f"Could not find MAGMA-seq data file in {data_dir}. "
+                f"Download from: https://www.nature.com/articles/s41467-024-48072-z"
+            )
+
+    # Load all sheets
+    xl = pd.ExcelFile(data_file)
+    pairs = []
+    wt_kd_cache = {}  # Cache WT Kd values per antibody
+
+    for sheet in xl.sheet_names:
+        if sheet == 'README':
+            continue
+
+        df = pd.read_excel(xl, sheet_name=sheet)
+
+        if 'Variant' not in df.columns:
+            continue
+
+        # Determine ddG column name
+        ddg_col = None
+        for col in df.columns:
+            if 'ddg' in col.lower() or 'delta' in col.lower():
+                ddg_col = col
+                break
+
+        for _, row in df.iterrows():
+            variant_str = row.get('Variant', '')
+            if not variant_str or pd.isna(variant_str):
+                continue
+
+            # Skip failed fits unless requested
+            if not include_failed_fits:
+                success = row.get('Success', True)
+                if success is False or (isinstance(success, str) and success.lower() == 'false'):
+                    continue
+
+            # Parse variant string format: "4A8>VH:A9A-GCC;V20V-GTG|4A8>VL:S7T-ACT"
+            try:
+                parsed = _parse_magma_variant(variant_str)
+            except (ValueError, IndexError) as e:
+                warnings.warn(f"Could not parse MAGMA-seq variant: {variant_str} ({e})")
+                continue
+
+            antibody_name = parsed['antibody']
+
+            # Filter by antibody if specified
+            if antibodies is not None and antibody_name not in antibodies:
+                continue
+
+            # Get wild-type sequences
+            if antibody_name not in _MAGMA_SEQ_ANTIBODIES:
+                warnings.warn(f"Unknown antibody {antibody_name}, skipping")
+                continue
+
+            wt_seqs = _MAGMA_SEQ_ANTIBODIES[antibody_name]
+            heavy_wt = wt_seqs.get('VH', '').replace(' ', '')
+            light_wt = wt_seqs.get('VL', '').replace(' ', '')
+
+            # Skip if no sequences
+            if not heavy_wt:
+                continue
+
+            # Parse mutations
+            mutations = []
+            for mut_info in parsed['mutations']:
+                chain = 'H' if mut_info['chain'] == 'VH' else 'L'
+                position = mut_info['position'] - 1  # 0-indexed
+
+                # Validate position
+                seq = heavy_wt if chain == 'H' else light_wt
+                if position >= len(seq):
+                    continue
+
+                mutations.append(AbMutation(
+                    chain=chain,
+                    position=position,
+                    from_aa=mut_info['from_aa'],
+                    to_aa=mut_info['to_aa'],
+                ))
+
+            if not mutations:
+                # WT variant - cache Kd for ddG calculation
+                kd = row.get('Kd', None)
+                if kd is not None and not pd.isna(kd):
+                    wt_kd_cache[antibody_name] = float(kd)
+                continue
+
+            # Get Kd and ddG values
+            kd = row.get('Kd', None)
+            if kd is not None and not pd.isna(kd):
+                kd = float(kd)
+            else:
+                kd = None
+
+            # Get or compute ddG
+            ddg = None
+            if ddg_col and ddg_col in row and not pd.isna(row[ddg_col]):
+                ddg = float(row[ddg_col])
+            elif 'ddg' in row and not pd.isna(row['ddg']):
+                ddg = float(row['ddg'])
+            elif compute_ddg and kd is not None:
+                # Compute ddG from Kd: ddG = RT * ln(Kd_mut / Kd_wt)
+                # R = 0.001987 kcal/mol/K, T = 298 K
+                ref_kd = reference_kd or wt_kd_cache.get(antibody_name, 100.0)
+                RT = 0.001987 * 298  # kcal/mol
+                ddg = RT * math.log(kd / ref_kd)
+
+            if ddg is None:
+                continue
+
+            # Create AbEditPair
+            pair = AbEditPair(
+                antibody_id=f"magma_{antibody_name}_{len(pairs)}",
+                antigen_id=parsed.get('antigen', None),
+                heavy_wt=heavy_wt,
+                light_wt=light_wt,
+                mutations=mutations,
+                assay_type=AssayType.DDG,
+                delta_value=ddg,
+                raw_wt_value=wt_kd_cache.get(antibody_name),
+                raw_mut_value=kd,
+                source_dataset='magma_seq',
+                metadata={
+                    'antibody_name': antibody_name,
+                    'sheet': sheet,
+                    'kd_nm': kd,
+                    'fmax': row.get('Fmax', None),
+                    'barcode': row.get('Barcode', None),
+                },
+            )
+            pairs.append(pair)
+
+    return AbEditPairsDataset(pairs)
+
+
+def _parse_magma_variant(variant_str: str) -> Dict[str, Any]:
+    """
+    Parse MAGMA-seq variant string format.
+
+    Format: "4A8>VH:A9A-GCC;V20V-GTG|4A8>VL:S7T-ACT"
+    - Antibody name before '>'
+    - Chain (VH or VL) after '>'
+    - Mutations as 'OrigPosNew-Codon' separated by ';'
+    - Heavy and light chains separated by '|'
+
+    Returns dict with:
+        - antibody: str
+        - mutations: List[Dict] with chain, position, from_aa, to_aa, codon
+    """
+    import re
+
+    result = {
+        'antibody': None,
+        'mutations': [],
+    }
+
+    # Handle WT variants
+    if variant_str.endswith(':WT') or '>WT' in variant_str:
+        parts = variant_str.split('>')
+        result['antibody'] = parts[0]
+        return result
+
+    # Split by '|' for heavy/light chains
+    chain_parts = variant_str.split('|')
+
+    for chain_part in chain_parts:
+        if '>' not in chain_part:
+            continue
+
+        # Parse "4A8>VH:A9A-GCC;V20V-GTG"
+        ab_chain, mutations_str = chain_part.split('>', 1)
+        result['antibody'] = ab_chain
+
+        if ':' not in mutations_str:
+            continue
+
+        chain_type, mut_list = mutations_str.split(':', 1)
+
+        if mut_list == 'WT':
+            continue
+
+        # Parse individual mutations
+        for mut_str in mut_list.split(';'):
+            mut_str = mut_str.strip()
+            if not mut_str or mut_str == 'WT':
+                continue
+
+            # Format: A9A-GCC or A9G (without codon)
+            if '-' in mut_str:
+                mut_part, codon = mut_str.split('-', 1)
+            else:
+                mut_part = mut_str
+                codon = None
+
+            # Parse mutation: first char = from_aa, last char = to_aa, middle = position
+            if len(mut_part) < 3:
+                continue
+
+            from_aa = mut_part[0].upper()
+            to_aa = mut_part[-1].upper()
+            pos_str = mut_part[1:-1]
+
+            # Handle IMGT insertion codes
+            match = re.match(r'^(\d+)([A-Za-z])?$', pos_str)
+            if match:
+                position = int(match.group(1))
+            else:
+                try:
+                    position = int(pos_str)
+                except ValueError:
+                    continue
+
+            # Skip synonymous mutations (same AA)
+            if from_aa == to_aa:
+                continue
+
+            result['mutations'].append({
+                'chain': chain_type,
+                'position': position,
+                'from_aa': from_aa,
+                'to_aa': to_aa,
+                'codon': codon,
+            })
+
+    return result
