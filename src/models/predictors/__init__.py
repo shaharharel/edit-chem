@@ -5,6 +5,8 @@ from .edit_effect_predictor import EditEffectPredictor, EditEffectMLP
 from .structured_edit_effect_predictor_v2 import StructuredEditEffectPredictor, StructuredEditEffectMLP
 from .trainable_property_predictor import TrainablePropertyPredictor, TrainablePropertyMLP
 from .trainable_edit_effect_predictor import TrainableEditEffectPredictor, TrainableEditEffectMLP
+from .antibody_effect_predictor import AntibodyEffectPredictor, AntibodyEffectMLP
+from .baseline_property_predictor import BaselinePropertyPredictor, BaselinePropertyMLP
 
 __all__ = [
     # Pre-computed embedding predictors
@@ -19,4 +21,10 @@ __all__ = [
     'TrainablePropertyMLP',
     'TrainableEditEffectPredictor',
     'TrainableEditEffectMLP',
+    # Antibody predictors
+    'AntibodyEffectPredictor',
+    'AntibodyEffectMLP',
+    # Baseline (non-edit) predictor
+    'BaselinePropertyPredictor',
+    'BaselinePropertyMLP',
 ]

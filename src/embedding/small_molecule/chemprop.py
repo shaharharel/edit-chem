@@ -342,8 +342,8 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
                     continue
 
                 # Forward through message passing
-                # The message_passing network is already on GPU, PyTorch should
-                # automatically move inputs from CPU to GPU as needed
+                # Move batch_graph to the same device as the model
+                batch_graph = batch_graph.to(self.device)
                 h = self.message_passing(batch_graph)
 
                 # Aggregate to molecule-level embeddings
@@ -495,8 +495,9 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
                     if mol_graph is None:
                         raise ValueError("Failed to create mol graph")
 
-                    # Create single-molecule batch
+                    # Create single-molecule batch and move to device
                     batch_graph = BatchMolGraph([mol_graph])
+                    batch_graph = batch_graph.to(self.device)
 
                     # Get atom-level embeddings from message passing
                     # h has shape [n_atoms_in_batch, hidden_dim]
@@ -586,8 +587,9 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
             return torch.zeros(len(smiles_list), self._embedding_dim,
                              dtype=torch.float32, device=self.device)
 
-        # Batch all graphs
+        # Batch all graphs and move to device
         batch_graph = BatchMolGraph(mol_graphs)
+        batch_graph = batch_graph.to(self.device)
 
         # Forward through message passing (NO torch.no_grad!)
         # Keep train mode if trainable, otherwise eval
@@ -673,8 +675,9 @@ class ChemPropEmbedder(nn.Module, MoleculeEmbedder):
                                   dtype=torch.float32, device=self.device)
             return {'atom_embeddings': atom_embs, 'mol_embeddings': mol_embs}
 
-        # Batch all graphs
+        # Batch all graphs and move to device
         batch_graph = BatchMolGraph(mol_graphs)
+        batch_graph = batch_graph.to(self.device)
 
         # Forward through message passing (NO torch.no_grad!)
         if self.trainable:

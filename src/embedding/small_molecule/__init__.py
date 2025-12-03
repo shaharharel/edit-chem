@@ -76,3 +76,17 @@ try:
 except ImportError:
     GraphMVPStructuredEditEmbedder = None
     download_graphmvp_checkpoints = None
+
+try:
+    from .unimol import UniMolEmbedder, create_unimol_embedder
+    __all__.extend(['UniMolEmbedder', 'create_unimol_embedder'])
+except ImportError:
+    UniMolEmbedder = None
+    create_unimol_embedder = None
+
+try:
+    from .unimol_structured import UniMolStructuredEditEmbedder, unimol_structured_embedder
+    __all__.extend(['UniMolStructuredEditEmbedder', 'unimol_structured_embedder'])
+except ImportError:
+    UniMolStructuredEditEmbedder = None
+    unimol_structured_embedder = None

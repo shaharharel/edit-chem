@@ -304,6 +304,11 @@ class UTRLMEmbedder(nn.Module):
     def output_dim(self) -> int:
         return self.embed_dim
 
+    @property
+    def embedding_dim(self) -> int:
+        """Alias for output_dim to match RNAEmbedder interface."""
+        return self.embed_dim
+
     def _tokenize(self, sequence: str) -> List[int]:
         """Convert sequence to token IDs."""
         sequence = sequence.upper().replace('T', 'U').replace(' ', '')
