@@ -1064,3 +1064,281 @@ def _parse_magma_variant(variant_str: str) -> Dict[str, Any]:
             })
 
     return result
+
+
+# =============================================================================
+# FLAb Dataset Loaders
+# =============================================================================
+# FLAb (Fitness Landscape for Antibodies) benchmark datasets
+# From: https://github.com/Graylab/FLAb
+# Reference: Paper datasets used in IgBert/IgT5 (PLOS Comp Bio 2024)
+
+# Wild-type sequences for FLAb datasets
+_FLAB_WT_SEQUENCES = {
+    # Koenig 2017 - G6 antibody against VEGF
+    'koenig2017': {
+        'heavy': 'EVQLVESGGGLVQPGGSLRLSCAASGFTISDYWIHWVRQAPGKGLEWVAGITPAGGYTYYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCARFVFFLPYAMDYWGQGTLVTVSS',
+        'light': 'DIQMTQSPSSLSASVGDRVTITCRASQDVSTAVAWYQQKPGKAPKLLIYSASFLYSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQQSYTTPPTFGQGTKVEIKR',
+        'antigen': 'VEGF',
+        'antibody_name': 'G6',
+    },
+    # Warszawski 2019 - D44.1 antibody against Hen lysozyme
+    'warszawski2019': {
+        'heavy': 'QVQLQESGAEIMKPGASVKISCKATGYTFSTYWIEWVKQRPGHGLEWIGEILPGSGSTYYNEKFKGKATFTADTSSNTAYMQLSSLTSEDSAVYYCARGDGNYGYWGQGTTLTV',
+        'light': 'DIELTQSPATLSVTPGDSVSLSCRASQSISNNLHWYQQKSHESPRLLIKYVSQSSSGIPSRFSGSGSGTDFTLSINSVETEDFGMYFCQQSNSWPRTFGGGTKLEIKR',
+        'antigen': 'Hen_lysozyme',
+        'antibody_name': 'D44.1',
+    },
+    # Shanehsazzadeh 2023 - Trastuzumab against HER2
+    'shanehsazzadeh2023': {
+        'heavy': 'EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCSRWGGDGFYAMDYWGQGTLVTVSS',
+        'light': 'DIQMTQSPSSLSASVGDRVTITCRASQDVNTAVAWYQQKPGKAPKLLIYSASFLYSGVPSRFSGSRSGTDFTLTISSLQPEDFATYYCQQHYTTPPTFGQGTKVEIK',
+        'antigen': 'HER2',
+        'antibody_name': 'Trastuzumab',
+    },
+}
+
+
+def _find_mutations_between_sequences(
+    wt_seq: str,
+    mut_seq: str,
+    chain: str,
+) -> List[AbMutation]:
+    """
+    Find mutations between wild-type and mutant sequences.
+
+    Args:
+        wt_seq: Wild-type sequence
+        mut_seq: Mutant sequence
+        chain: Chain identifier ('H' or 'L')
+
+    Returns:
+        List of AbMutation objects
+    """
+    mutations = []
+
+    # Handle length differences - only compare up to shorter sequence
+    min_len = min(len(wt_seq), len(mut_seq))
+
+    for i in range(min_len):
+        if wt_seq[i] != mut_seq[i]:
+            mutations.append(AbMutation(
+                chain=chain,
+                position=i,
+                from_aa=wt_seq[i],
+                to_aa=mut_seq[i],
+            ))
+
+    return mutations
+
+
+def load_flab_binding(
+    data_dir: str,
+    dataset: str = 'koenig2017',
+    include_wt: bool = False,
+) -> AbEditPairsDataset:
+    """
+    Load FLAb binding affinity dataset.
+
+    FLAb (Fitness Landscape for Antibodies) contains binding affinity data
+    from multiple DMS studies. Data from: https://github.com/Graylab/FLAb
+
+    Args:
+        data_dir: Directory containing FLAb CSV files
+        dataset: Which dataset to load. Options:
+            - 'koenig2017': G6 antibody vs VEGF (4,274 variants)
+            - 'warszawski2019': D44.1 antibody vs Hen lysozyme (2,047 variants)
+            - 'shanehsazzadeh2023': Trastuzumab vs HER2 (421 variants)
+            - 'all': Load all datasets combined
+        include_wt: Whether to include wild-type (no mutation) entries
+
+    Returns:
+        AbEditPairsDataset with loaded data
+
+    Expected files in data_dir:
+        - koenig2017_binding.csv
+        - warszawski2019_binding.csv
+        - shanehsazzadeh2023_binding.csv
+    """
+    data_dir = Path(data_dir)
+    pairs = []
+
+    # Determine which datasets to load
+    if dataset == 'all':
+        datasets_to_load = ['koenig2017', 'warszawski2019', 'shanehsazzadeh2023']
+    else:
+        datasets_to_load = [dataset]
+
+    for ds_name in datasets_to_load:
+        if ds_name not in _FLAB_WT_SEQUENCES:
+            raise ValueError(f"Unknown FLAb dataset: {ds_name}")
+
+        # Find the data file
+        file_path = data_dir / f'{ds_name}_binding.csv'
+        if not file_path.exists():
+            warnings.warn(f"FLAb binding file not found: {file_path}")
+            continue
+
+        # Load data
+        df = pd.read_csv(file_path)
+
+        # Get WT sequences
+        wt_info = _FLAB_WT_SEQUENCES[ds_name]
+        wt_heavy = wt_info['heavy']
+        wt_light = wt_info['light']
+
+        # Identify fitness/binding column
+        fitness_col = None
+        for col in ['fitness', '-log( KD (M) )', '-log(KD (M))', '-log10 (KD (M) )']:
+            if col in df.columns:
+                fitness_col = col
+                break
+
+        if fitness_col is None:
+            warnings.warn(f"No fitness column found in {ds_name}")
+            continue
+
+        for _, row in df.iterrows():
+            heavy_seq = row.get('heavy', '')
+            light_seq = row.get('light', '')
+
+            if not heavy_seq or not light_seq:
+                continue
+
+            # Find mutations
+            heavy_mutations = _find_mutations_between_sequences(wt_heavy, heavy_seq, 'H')
+            light_mutations = _find_mutations_between_sequences(wt_light, light_seq, 'L')
+            all_mutations = heavy_mutations + light_mutations
+
+            # Skip WT if not requested
+            if not include_wt and len(all_mutations) == 0:
+                continue
+
+            # Get fitness value
+            fitness = row.get(fitness_col)
+            if pd.isna(fitness):
+                continue
+
+            try:
+                fitness = float(fitness)
+            except (ValueError, TypeError):
+                continue
+
+            # Create AbEditPair
+            pair = AbEditPair(
+                antibody_id=f"{wt_info['antibody_name']}_{ds_name}",
+                antigen_id=wt_info['antigen'],
+                heavy_wt=wt_heavy,
+                light_wt=wt_light,
+                mutations=all_mutations,
+                assay_type='binding_affinity',
+                delta_value=fitness,
+                source_dataset=f'flab_{ds_name}',
+                metadata={
+                    'dataset': ds_name,
+                    'heavy_mut_seq': heavy_seq,
+                    'light_mut_seq': light_seq,
+                },
+            )
+            pairs.append(pair)
+
+    return AbEditPairsDataset(pairs)
+
+
+def load_flab_expression(
+    data_dir: str,
+    dataset: str = 'koenig2017',
+    include_wt: bool = False,
+) -> AbEditPairsDataset:
+    """
+    Load FLAb expression dataset.
+
+    FLAb contains expression/enrichment ratio data from DMS studies.
+    Data from: https://github.com/Graylab/FLAb
+
+    Args:
+        data_dir: Directory containing FLAb CSV files
+        dataset: Which dataset to load. Currently supports:
+            - 'koenig2017': G6 antibody expression (4,274 variants)
+        include_wt: Whether to include wild-type (no mutation) entries
+
+    Returns:
+        AbEditPairsDataset with loaded data
+
+    Expected files in data_dir:
+        - koenig2017_expression.csv
+    """
+    data_dir = Path(data_dir)
+    pairs = []
+
+    if dataset not in _FLAB_WT_SEQUENCES:
+        raise ValueError(f"Unknown FLAb dataset: {dataset}")
+
+    # Find the data file
+    file_path = data_dir / f'{dataset}_expression.csv'
+    if not file_path.exists():
+        raise FileNotFoundError(f"FLAb expression file not found: {file_path}")
+
+    # Load data
+    df = pd.read_csv(file_path)
+
+    # Get WT sequences
+    wt_info = _FLAB_WT_SEQUENCES[dataset]
+    wt_heavy = wt_info['heavy']
+    wt_light = wt_info['light']
+
+    # Identify fitness/expression column
+    fitness_col = None
+    for col in ['fitness', 'enrichment ratio', 'expression']:
+        if col in df.columns:
+            fitness_col = col
+            break
+
+    if fitness_col is None:
+        raise ValueError(f"No fitness/expression column found in {dataset}")
+
+    for _, row in df.iterrows():
+        heavy_seq = row.get('heavy', '')
+        light_seq = row.get('light', '')
+
+        if not heavy_seq or not light_seq:
+            continue
+
+        # Find mutations
+        heavy_mutations = _find_mutations_between_sequences(wt_heavy, heavy_seq, 'H')
+        light_mutations = _find_mutations_between_sequences(wt_light, light_seq, 'L')
+        all_mutations = heavy_mutations + light_mutations
+
+        # Skip WT if not requested
+        if not include_wt and len(all_mutations) == 0:
+            continue
+
+        # Get fitness value
+        fitness = row.get(fitness_col)
+        if pd.isna(fitness):
+            continue
+
+        try:
+            fitness = float(fitness)
+        except (ValueError, TypeError):
+            continue
+
+        # Create AbEditPair
+        pair = AbEditPair(
+            antibody_id=f"{wt_info['antibody_name']}_{dataset}",
+            antigen_id=wt_info['antigen'],
+            heavy_wt=wt_heavy,
+            light_wt=wt_light,
+            mutations=all_mutations,
+            assay_type='expression',
+            delta_value=fitness,
+            source_dataset=f'flab_{dataset}_expression',
+            metadata={
+                'dataset': dataset,
+                'heavy_mut_seq': heavy_seq,
+                'light_mut_seq': light_seq,
+            },
+        )
+        pairs.append(pair)
+
+    return AbEditPairsDataset(pairs)

@@ -237,9 +237,15 @@ class AntiBERTa2Embedder(AntibodyEmbedder):
         return_attention: bool = False,
     ) -> tuple:
         """Encode a single chain."""
+        # CRITICAL: AntiBERTa2 (RoFormer) requires SPACE-SEPARATED amino acids!
+        # Without spaces, the entire sequence becomes a single [UNK] token.
+        # E.g., "EVQL" -> [CLS, UNK, SEP] (wrong)
+        #       "E V Q L" -> [CLS, E, V, Q, L, SEP] (correct)
+        spaced_sequence = ' '.join(sequence)
+
         # Tokenize
         tokens = self.tokenizer(
-            sequence,
+            spaced_sequence,
             add_special_tokens=True,
             max_length=self.max_length,
             truncation=True,
@@ -287,6 +293,54 @@ class AntiBERTa2Embedder(AntibodyEmbedder):
         heavy_sequence = heavy_sequence.upper().strip()
         light_sequence = light_sequence.upper().strip()
 
+        has_heavy = len(heavy_sequence) > 0
+        has_light = len(light_sequence) > 0
+
+        # Handle missing chains - cross-attention requires both chains
+        if not has_heavy and not has_light:
+            # Return zeros if both chains are empty
+            zero_emb = torch.zeros(self._embedding_dim, device=self._device)
+            return AntibodyEmbedderOutput(
+                heavy_residue_embeddings=torch.zeros(0, self._embedding_dim, device=self._device),
+                light_residue_embeddings=torch.zeros(0, self._embedding_dim, device=self._device),
+                global_embedding=zero_emb,
+                heavy_attention_weights=None,
+                light_attention_weights=None,
+                heavy_sequence=heavy_sequence,
+                light_sequence=light_sequence,
+            )
+
+        if not has_heavy or not has_light:
+            # If only one chain, use self-attention by passing it as both
+            single_seq = heavy_sequence if has_heavy else light_sequence
+            single_emb, single_attn = self._encode_single_chain(single_seq, return_attention)
+
+            # Use the single chain as both heavy and light for fusion
+            # This gives a self-attention enriched representation
+            heavy_fused, light_fused, global_emb = self.fusion(single_emb, single_emb)
+
+            if has_heavy:
+                return AntibodyEmbedderOutput(
+                    heavy_residue_embeddings=heavy_fused,
+                    light_residue_embeddings=torch.zeros(0, self._embedding_dim, device=self._device),
+                    global_embedding=global_emb,
+                    heavy_attention_weights=single_attn,
+                    light_attention_weights=None,
+                    heavy_sequence=heavy_sequence,
+                    light_sequence=light_sequence,
+                )
+            else:
+                return AntibodyEmbedderOutput(
+                    heavy_residue_embeddings=torch.zeros(0, self._embedding_dim, device=self._device),
+                    light_residue_embeddings=light_fused,
+                    global_embedding=global_emb,
+                    heavy_attention_weights=None,
+                    light_attention_weights=single_attn,
+                    heavy_sequence=heavy_sequence,
+                    light_sequence=light_sequence,
+                )
+
+        # Both chains present - normal path
         # Encode each chain separately
         heavy_emb, heavy_attn = self._encode_single_chain(heavy_sequence, return_attention)
         light_emb, light_attn = self._encode_single_chain(light_sequence, return_attention)
@@ -327,9 +381,13 @@ class AntiBERTa2Embedder(AntibodyEmbedder):
         heavy_sequences = [h.upper().strip() for h in heavy_sequences]
         light_sequences = [l.upper().strip() for l in light_sequences]
 
+        # CRITICAL: Space-separate for RoFormer tokenizer
+        heavy_spaced = [' '.join(h) for h in heavy_sequences]
+        light_spaced = [' '.join(l) for l in light_sequences]
+
         # Tokenize heavy chains
         heavy_tokens = self.tokenizer(
-            heavy_sequences,
+            heavy_spaced,
             add_special_tokens=True,
             max_length=self.max_length,
             truncation=True,
@@ -340,7 +398,7 @@ class AntiBERTa2Embedder(AntibodyEmbedder):
 
         # Tokenize light chains
         light_tokens = self.tokenizer(
-            light_sequences,
+            light_spaced,
             add_special_tokens=True,
             max_length=self.max_length,
             truncation=True,

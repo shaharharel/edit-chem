@@ -39,8 +39,8 @@ def main():
 
             # For standard methods: use chembl_pairs_long_sample.csv
             # For Structured Edit methods: use chembl_pairs_mmpdb.csv (has MMP atom-level columns)
-            data_file="../../data/small_molecules/pairs/chembl_pairs_long_sample.csv",
-            # data_file="../../data/small_molecules/pairs/mmpdb/chembl_pairs_mmpdb.csv",  # For structured edit
+            #data_file="../../data/small_molecules/pairs/chembl_pairs_long_sample.csv",
+            data_file="../../data/small_molecules/pairs/mmpdb/chembl_pairs_mmpdb.csv",  # For structured edit
 
             splitter_type=splitter_type,
             splitter_params=splitter_params,

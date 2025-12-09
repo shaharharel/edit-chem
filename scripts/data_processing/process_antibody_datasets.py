@@ -193,12 +193,20 @@ class AbAgymProcessor(DatasetProcessor):
         # Load data
         data_file = self.data_dir / "abagym" / "AbAgym_data_non-redundant.csv"
         meta_file = self.data_dir / "abagym" / "AbAgym_metadata.csv"
+        seq_file = self.data_dir / "abagym" / "abagym_sequences.json"
 
         if not data_file.exists():
             raise FileNotFoundError(f"AbAgym data not found at {data_file}")
 
         df = pd.read_csv(data_file)
         meta_df = pd.read_csv(meta_file) if meta_file.exists() else None
+
+        # Load sequences from JSON file
+        sequences = {}
+        if seq_file.exists():
+            with open(seq_file, 'r') as f:
+                sequences = json.load(f)
+            print(f"  Loaded sequences for {len(sequences)} antibodies")
 
         # Create antigen lookup from metadata
         antigen_lookup = {}
@@ -217,13 +225,18 @@ class AbAgymProcessor(DatasetProcessor):
             pdb_file = group.iloc[0]['PDB_file']
             pdb_id = self._extract_pdb_id(pdb_file)
 
-            # We need to reconstruct sequences from mutations
-            # For now, we'll create entries without full sequences
-            # and mark them as needing sequence resolution
+            # Get sequences for this antibody
+            ab_seqs = sequences.get(dms_name, {})
+            heavy_wt = ab_seqs.get('heavy', '')
+            light_wt = ab_seqs.get('light', '')
+
+            if not heavy_wt:
+                self.log_warning(f"No sequence found for {dms_name}")
+                self.stats['missing_sequences'] += 1
 
             for _, row in group.iterrows():
                 try:
-                    entry = self._process_abagym_row(row, dms_name, antigen_lookup, pdb_id)
+                    entry = self._process_abagym_row(row, dms_name, antigen_lookup, pdb_id, heavy_wt, light_wt)
                     if entry:
                         entries.append(entry)
                         self.stats['entries_processed'] += 1
@@ -248,6 +261,8 @@ class AbAgymProcessor(DatasetProcessor):
         dms_name: str,
         antigen_lookup: Dict[str, str],
         pdb_id: str,
+        heavy_wt: str,
+        light_wt: str,
     ) -> Optional[UnifiedAntibodyEntry]:
         """Process a single AbAgym row."""
 
@@ -280,16 +295,14 @@ class AbAgymProcessor(DatasetProcessor):
         dms_score = row['DMS_score']
         interface_dist = row.get('closest_interface_atom_distance', None)
 
-        # Create entry
-        # Note: We don't have full sequences for AbAgym entries
-        # We'll need to fetch them from PDB or mark as incomplete
+        # Create entry with sequences from the JSON file
         entry = UnifiedAntibodyEntry(
             entry_id=f"abagym_{dms_name}_{mut_name}",
             antibody_id=dms_name,
             antigen_id=antigen_lookup.get(dms_name, 'unknown'),
             source_dataset='abagym',
-            heavy_wt='',  # Will need to be resolved
-            light_wt='',
+            heavy_wt=heavy_wt,
+            light_wt=light_wt,
             mutations=[mutation.to_dict()],
             delta_value=float(dms_score),
             assay_type=AssayType.ENRICHMENT.value,
@@ -319,11 +332,19 @@ class SKEMPI2Processor(DatasetProcessor):
         print("Processing SKEMPI2 dataset...")
 
         data_file = self.data_dir / "skempi2" / "skempi_v2.csv"
+        seq_file = self.data_dir / "skempi2" / "skempi2_chain_info.json"
 
         if not data_file.exists():
             raise FileNotFoundError(f"SKEMPI2 data not found at {data_file}")
 
         df = pd.read_csv(data_file, sep=';')
+
+        # Load sequences from JSON file
+        sequences = {}
+        if seq_file.exists():
+            with open(seq_file, 'r') as f:
+                sequences = json.load(f)
+            print(f"  Loaded sequences for {len(sequences)} complexes")
 
         # Filter for antibody entries
         antibody_keywords = ['antibody', 'fab', 'igg', 'fv', 'scfv', 'nanobody', 'vhh', 'immunoglobulin']
@@ -339,7 +360,7 @@ class SKEMPI2Processor(DatasetProcessor):
 
         for _, row in ab_df.iterrows():
             try:
-                entry = self._process_skempi2_row(row)
+                entry = self._process_skempi2_row(row, sequences)
                 if entry:
                     entries.append(entry)
                     self.stats['entries_processed'] += 1
@@ -350,10 +371,11 @@ class SKEMPI2Processor(DatasetProcessor):
         print(f"  Processed {len(entries)} entries")
         return entries
 
-    def _process_skempi2_row(self, row: pd.Series) -> Optional[UnifiedAntibodyEntry]:
+    def _process_skempi2_row(self, row: pd.Series, sequences: Dict[str, Any]) -> Optional[UnifiedAntibodyEntry]:
         """Process a single SKEMPI2 row."""
 
-        pdb_id = row.get('#Pdb', '').split('_')[0]
+        pdb_entry = row.get('#Pdb', '')
+        pdb_id = pdb_entry.split('_')[0]
         mutation_str = row.get('Mutation(s)_cleaned', '')
 
         # Parse mutations
@@ -375,13 +397,24 @@ class SKEMPI2Processor(DatasetProcessor):
         else:
             antigen_id = protein1
 
+        # Get sequences from the JSON file
+        # Try different key formats: "1AHW_AB_C" or just "1AHW"
+        heavy_wt = ''
+        light_wt = ''
+        for key in [pdb_entry, pdb_id]:
+            if key in sequences:
+                seq_info = sequences[key]
+                heavy_wt = seq_info.get('heavy_sequence', '')
+                light_wt = seq_info.get('light_sequence', '')
+                break
+
         entry = UnifiedAntibodyEntry(
             entry_id=f"skempi2_{pdb_id}_{mutation_str.replace(',', '_')}",
             antibody_id=pdb_id,
             antigen_id=antigen_id,
             source_dataset='skempi2',
-            heavy_wt='',  # Will need to be fetched from PDB
-            light_wt='',
+            heavy_wt=heavy_wt,
+            light_wt=light_wt,
             mutations=[m.to_dict() for m in mutations],
             delta_value=ddg,
             assay_type=AssayType.DDG.value,
