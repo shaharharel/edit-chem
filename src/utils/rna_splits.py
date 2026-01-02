@@ -788,6 +788,547 @@ class LengthStratifiedSplitter(RNASplitter):
         )
 
 
+class PositionSplitter(RNASplitter):
+    """
+    Split by edit position within the sequence.
+
+    Tests whether the model learns position-invariant edit effects
+    or memorizes position-specific patterns.
+
+    Example: Train on positions 0-3 (5' end), test on positions 4-6 (3' end)
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        position_col: str = 'edit_positions_str',
+        seq_col: str = 'loop_A',
+        train_positions: Optional[List[int]] = None,
+        test_positions: Optional[List[int]] = None,
+        split_point: Optional[float] = 0.5  # Split at middle by default
+    ):
+        """
+        Initialize position splitter.
+
+        Args:
+            position_col: Column containing edit position(s)
+            seq_col: Column containing sequence (for length normalization)
+            train_positions: Explicit list of positions for training
+            test_positions: Explicit list of positions for testing
+            split_point: If train/test_positions not specified, split at this
+                        relative position (0.5 = middle)
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.position_col = position_col
+        self.seq_col = seq_col
+        self.train_positions = train_positions
+        self.test_positions = test_positions
+        self.split_point = split_point
+
+    def _get_position(self, row) -> int:
+        """Extract primary edit position from row."""
+        pos_str = str(row[self.position_col])
+        # Handle multiple positions (take first)
+        if ',' in pos_str:
+            pos_str = pos_str.split(',')[0]
+        try:
+            return int(pos_str)
+        except ValueError:
+            return -1
+
+    def _get_relative_position(self, row) -> float:
+        """Get position as fraction of sequence length."""
+        pos = self._get_position(row)
+        seq_len = len(row[self.seq_col]) if self.seq_col in row else 7
+        if pos < 0 or seq_len == 0:
+            return -1
+        return pos / seq_len
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        seq_col: str = 'seq_a'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by edit position.
+
+        Strategy:
+        1. Extract edit position for each row
+        2. Assign to train/test based on position criteria
+        3. Split validation from training set
+        """
+        print(f"Splitting by edit position ({self.position_col})...")
+
+        # Get positions
+        positions = df.apply(self._get_position, axis=1).values
+
+        # If explicit positions not given, use relative split
+        if self.train_positions is None or self.test_positions is None:
+            seq_lens = df[self.seq_col].str.len().values if self.seq_col in df.columns else np.full(len(df), 7)
+            rel_positions = positions / np.maximum(seq_lens, 1)
+
+            # Determine split point
+            train_mask = rel_positions < self.split_point
+            test_mask = rel_positions >= self.split_point
+        else:
+            train_mask = np.isin(positions, self.train_positions)
+            test_mask = np.isin(positions, self.test_positions)
+
+        # Handle invalid positions
+        valid_mask = positions >= 0
+        train_mask = train_mask & valid_mask
+        test_mask = test_mask & valid_mask
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        print(f"  Positions distribution:")
+        print(f"    Train region: {train_mask.sum()} samples")
+        print(f"    Test region: {test_mask.sum()} samples")
+
+        # Split validation from training
+        np.random.seed(self.random_state)
+        np.random.shuffle(train_indices)
+
+        n_train = len(train_indices)
+        n_val = int(n_train * self.val_size / (self.train_size + self.val_size))
+
+        val_indices = train_indices[:n_val]
+        train_indices = train_indices[n_val:]
+
+        print(f"  Final split: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+        return self._split_indices_to_dataframes(
+            df,
+            train_indices,
+            val_indices,
+            test_indices
+        )
+
+
+class NeighborhoodContextSplitter(RNASplitter):
+    """
+    Split by sequence context around the edit site.
+
+    Tests whether the model learns intrinsic edit effects or just
+    memorizes context-specific patterns (e.g., "C-rich = good").
+
+    Example: Train on A/U-rich contexts, test on G/C-rich contexts
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        upstream_col: str = 'context_3nt_upstream',
+        downstream_col: str = 'context_3nt_downstream',
+        split_by: str = 'gc_content',  # 'gc_content', 'kmer', or 'nucleotide'
+        gc_threshold: float = 0.5,  # For gc_content mode
+        train_contexts: Optional[List[str]] = None,  # For explicit context lists
+        test_contexts: Optional[List[str]] = None
+    ):
+        """
+        Initialize neighborhood context splitter.
+
+        Args:
+            upstream_col: Column with upstream context
+            downstream_col: Column with downstream context
+            split_by: How to split contexts
+                - 'gc_content': Split by GC content of neighborhood
+                - 'kmer': Split by specific k-mer patterns
+                - 'nucleotide': Split by nucleotide at specific position
+            gc_threshold: GC content threshold for splitting
+            train_contexts: Explicit list of context patterns for training
+            test_contexts: Explicit list of context patterns for testing
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.upstream_col = upstream_col
+        self.downstream_col = downstream_col
+        self.split_by = split_by
+        self.gc_threshold = gc_threshold
+        self.train_contexts = train_contexts
+        self.test_contexts = test_contexts
+
+    def _get_context_gc(self, row) -> float:
+        """Compute GC content of neighborhood context."""
+        upstream = str(row.get(self.upstream_col, '')).upper()
+        downstream = str(row.get(self.downstream_col, '')).upper()
+        context = upstream + downstream
+
+        if len(context) == 0:
+            return 0.5
+
+        gc = sum(1 for c in context if c in 'GC')
+        return gc / len(context)
+
+    def _get_context_signature(self, row) -> str:
+        """Get context signature for splitting."""
+        upstream = str(row.get(self.upstream_col, '')).upper()
+        downstream = str(row.get(self.downstream_col, '')).upper()
+        return f"{upstream}_{downstream}"
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        seq_col: str = 'seq_a'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by neighborhood context.
+        """
+        print(f"Splitting by neighborhood context ({self.split_by})...")
+
+        if self.split_by == 'gc_content':
+            # Split by GC content of context
+            gc_values = df.apply(self._get_context_gc, axis=1).values
+
+            print(f"  Context GC range: [{gc_values.min():.2f}, {gc_values.max():.2f}]")
+            print(f"  Mean GC: {gc_values.mean():.2f}")
+
+            train_mask = gc_values < self.gc_threshold
+            test_mask = gc_values >= self.gc_threshold
+
+            print(f"  Low GC (train): {train_mask.sum()} samples")
+            print(f"  High GC (test): {test_mask.sum()} samples")
+
+        elif self.split_by == 'kmer':
+            # Split by explicit k-mer patterns
+            if self.train_contexts is None or self.test_contexts is None:
+                raise ValueError("kmer split requires train_contexts and test_contexts")
+
+            signatures = df.apply(self._get_context_signature, axis=1)
+
+            train_mask = signatures.isin(self.train_contexts)
+            test_mask = signatures.isin(self.test_contexts)
+
+        else:
+            raise ValueError(f"Unknown split_by: {self.split_by}")
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        # Split validation from training
+        np.random.seed(self.random_state)
+        np.random.shuffle(train_indices)
+
+        n_train = len(train_indices)
+        n_val = int(n_train * self.val_size / (self.train_size + self.val_size))
+
+        val_indices = train_indices[:n_val]
+        train_indices = train_indices[n_val:]
+
+        print(f"  Final split: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+        return self._split_indices_to_dataframes(
+            df,
+            train_indices,
+            val_indices,
+            test_indices
+        )
+
+
+class ExperimentalContextSplitter(RNASplitter):
+    """
+    Split by experimental context/condition.
+
+    Tests cross-context generalization: train on one experimental
+    condition (e.g., A_vs_A), test on another (e.g., M_vs_M).
+
+    This is the "cross-context" split used in the m6A experiments.
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        context_col: str = 'pair_type',
+        train_contexts: List[str] = None,
+        test_contexts: List[str] = None
+    ):
+        """
+        Initialize experimental context splitter.
+
+        Args:
+            context_col: Column containing experimental context
+            train_contexts: List of contexts for training (e.g., ['A_vs_A'])
+            test_contexts: List of contexts for testing (e.g., ['M_vs_M'])
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.context_col = context_col
+        self.train_contexts = train_contexts or ['A_vs_A']
+        self.test_contexts = test_contexts or ['M_vs_M']
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        seq_col: str = 'seq_a'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by experimental context.
+        """
+        print(f"Splitting by experimental context ({self.context_col})...")
+
+        contexts = df[self.context_col].values
+        unique_contexts = np.unique(contexts)
+
+        print(f"  Available contexts: {unique_contexts}")
+        print(f"  Train contexts: {self.train_contexts}")
+        print(f"  Test contexts: {self.test_contexts}")
+
+        train_mask = np.isin(contexts, self.train_contexts)
+        test_mask = np.isin(contexts, self.test_contexts)
+
+        for ctx in unique_contexts:
+            count = (contexts == ctx).sum()
+            print(f"    {ctx}: {count} samples")
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        # Split validation from training
+        np.random.seed(self.random_state)
+        np.random.shuffle(train_indices)
+
+        n_train = len(train_indices)
+        n_val = int(n_train * self.val_size / (self.train_size + self.val_size))
+
+        val_indices = train_indices[:n_val]
+        train_indices = train_indices[n_val:]
+
+        print(f"  Final split: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+        return self._split_indices_to_dataframes(
+            df,
+            train_indices,
+            val_indices,
+            test_indices
+        )
+
+
+class EffectMagnitudeSplitter(RNASplitter):
+    """
+    Split by magnitude of effect (target value).
+
+    Tests whether the model can extrapolate to effects larger than
+    those seen during training.
+
+    Example: Train on small effects, test on large effects
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        target_col: str = 'delta_intensity_median',
+        train_percentile: float = 75,  # Train on bottom 75%
+        test_percentile: float = 75,   # Test on top 25%
+        absolute: bool = True  # Use absolute value
+    ):
+        """
+        Initialize effect magnitude splitter.
+
+        Args:
+            target_col: Column containing effect values
+            train_percentile: Train on effects below this percentile
+            test_percentile: Test on effects above this percentile
+            absolute: If True, use absolute value of effect
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.target_col = target_col
+        self.train_percentile = train_percentile
+        self.test_percentile = test_percentile
+        self.absolute = absolute
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        seq_col: str = 'seq_a'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by effect magnitude.
+        """
+        print(f"Splitting by effect magnitude ({self.target_col})...")
+
+        values = df[self.target_col].values
+        if self.absolute:
+            magnitudes = np.abs(values)
+        else:
+            magnitudes = values
+
+        train_threshold = np.percentile(magnitudes, self.train_percentile)
+        test_threshold = np.percentile(magnitudes, self.test_percentile)
+
+        print(f"  Effect range: [{magnitudes.min():.2f}, {magnitudes.max():.2f}]")
+        print(f"  Train threshold (p{self.train_percentile}): {train_threshold:.2f}")
+        print(f"  Test threshold (p{self.test_percentile}): {test_threshold:.2f}")
+
+        train_mask = magnitudes <= train_threshold
+        test_mask = magnitudes > test_threshold
+
+        print(f"  Small effects (train): {train_mask.sum()} samples")
+        print(f"  Large effects (test): {test_mask.sum()} samples")
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        # Split validation from training
+        np.random.seed(self.random_state)
+        np.random.shuffle(train_indices)
+
+        n_train = len(train_indices)
+        n_val = int(n_train * self.val_size / (self.train_size + self.val_size))
+
+        val_indices = train_indices[:n_val]
+        train_indices = train_indices[n_val:]
+
+        print(f"  Final split: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+        return self._split_indices_to_dataframes(
+            df,
+            train_indices,
+            val_indices,
+            test_indices
+        )
+
+
+class NucleotideChangeSplitter(RNASplitter):
+    """
+    Split by type of nucleotide change.
+
+    Tests whether the model learns transferable edit effects across
+    different mutation types.
+
+    Example: Train on A→C edits, test on A→G edits
+    """
+
+    def __init__(
+        self,
+        train_size: float = 0.7,
+        val_size: float = 0.15,
+        test_size: float = 0.15,
+        random_state: Optional[int] = 42,
+        edit_col: str = 'edit_description',
+        train_changes: Optional[List[str]] = None,  # e.g., ['A>C', 'A>G']
+        test_changes: Optional[List[str]] = None,   # e.g., ['A>U']
+        group_by: str = 'exact'  # 'exact', 'transition_transversion', 'from_nucleotide'
+    ):
+        """
+        Initialize nucleotide change splitter.
+
+        Args:
+            edit_col: Column containing edit description (e.g., "0:A>C")
+            train_changes: List of nucleotide changes for training
+            test_changes: List of nucleotide changes for testing
+            group_by: How to group changes
+                - 'exact': Use exact change (A>C, A>G, etc.)
+                - 'transition_transversion': Group by type
+                - 'from_nucleotide': Group by original nucleotide
+        """
+        super().__init__(train_size, val_size, test_size, random_state)
+        self.edit_col = edit_col
+        self.train_changes = train_changes
+        self.test_changes = test_changes
+        self.group_by = group_by
+
+    def _extract_change(self, edit_desc: str) -> str:
+        """Extract nucleotide change from edit description."""
+        # Format: "0:A>C" or just "A>C"
+        edit_desc = str(edit_desc)
+        if ':' in edit_desc:
+            edit_desc = edit_desc.split(':')[1]
+        return edit_desc.upper()
+
+    def _classify_change(self, change: str) -> str:
+        """Classify the nucleotide change."""
+        if '>' not in change:
+            return 'unknown'
+
+        parts = change.split('>')
+        if len(parts) != 2:
+            return 'unknown'
+
+        from_nuc, to_nuc = parts[0][-1], parts[1][0]  # Handle multi-char
+
+        if self.group_by == 'exact':
+            return f"{from_nuc}>{to_nuc}"
+        elif self.group_by == 'from_nucleotide':
+            return from_nuc
+        elif self.group_by == 'transition_transversion':
+            purines = {'A', 'G'}
+            pyrimidines = {'C', 'U', 'T'}
+            if (from_nuc in purines and to_nuc in purines) or \
+               (from_nuc in pyrimidines and to_nuc in pyrimidines):
+                return 'transition'
+            else:
+                return 'transversion'
+        else:
+            return f"{from_nuc}>{to_nuc}"
+
+    def split(
+        self,
+        df: pd.DataFrame,
+        seq_col: str = 'seq_a'
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Split by nucleotide change type.
+        """
+        print(f"Splitting by nucleotide change ({self.group_by})...")
+
+        # Extract and classify changes
+        changes = df[self.edit_col].apply(self._extract_change)
+        classified = changes.apply(self._classify_change)
+
+        # Show distribution
+        change_counts = classified.value_counts()
+        print(f"  Change distribution:")
+        for change, count in change_counts.items():
+            print(f"    {change}: {count}")
+
+        # Determine train/test split
+        if self.train_changes is None or self.test_changes is None:
+            # Auto-split: most common to train, least common to test
+            sorted_changes = change_counts.index.tolist()
+            n_train = max(1, int(len(sorted_changes) * 0.7))
+            self.train_changes = sorted_changes[:n_train]
+            self.test_changes = sorted_changes[n_train:]
+
+        print(f"  Train changes: {self.train_changes}")
+        print(f"  Test changes: {self.test_changes}")
+
+        train_mask = classified.isin(self.train_changes).values
+        test_mask = classified.isin(self.test_changes).values
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        # Split validation from training
+        np.random.seed(self.random_state)
+        np.random.shuffle(train_indices)
+
+        n_train = len(train_indices)
+        n_val = int(n_train * self.val_size / (self.train_size + self.val_size))
+
+        val_indices = train_indices[:n_val]
+        train_indices = train_indices[n_val:]
+
+        print(f"  Final split: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+        return self._split_indices_to_dataframes(
+            df,
+            train_indices,
+            val_indices,
+            test_indices
+        )
+
+
 def get_rna_splitter(
     split_type: str,
     train_size: float = 0.7,
@@ -800,25 +1341,50 @@ def get_rna_splitter(
     Factory function to get an RNA splitter by name.
 
     Args:
-        split_type: One of ['random', 'sequence_similarity', 'motif',
-                    'edit_type', 'gc_stratified', 'length_stratified']
+        split_type: One of:
+            Basic splits:
+            - 'random': Random baseline split
+            - 'sequence_similarity': K-mer based sequence clustering
+            - 'motif': Split by regulatory motif presence
+            - 'edit_type': Split by SNV/insertion/deletion type
+            - 'gc_stratified': Stratified by GC content
+            - 'length_stratified': Stratified by sequence length
+
+            Generalization splits (for testing model generalization):
+            - 'position': Split by edit position (5' vs 3')
+            - 'neighborhood_context': Split by context around edit (GC-rich vs AT-rich)
+            - 'experimental_context': Split by experimental condition (A_vs_A vs M_vs_M)
+            - 'effect_magnitude': Split by effect size (small vs large effects)
+            - 'nucleotide_change': Split by mutation type (A>C vs A>G, etc.)
+
         train_size, val_size, test_size: Split fractions
         random_state: Random seed
         **kwargs: Additional arguments for specific splitters
-                 - sequence_similarity: kmer_size, similarity_threshold
-                 - motif: motif_types
-                 - edit_type: position_bins
-                 - gc_stratified: n_bins
-                 - length_stratified: n_bins
+            - sequence_similarity: kmer_size, similarity_threshold
+            - motif: motif_types
+            - edit_type: position_bins
+            - gc_stratified: n_bins
+            - length_stratified: n_bins
+            - position: position_col, seq_col, train_positions, test_positions, split_point
+            - neighborhood_context: upstream_col, downstream_col, split_by, gc_threshold
+            - experimental_context: context_col, train_contexts, test_contexts
+            - effect_magnitude: target_col, train_percentile, test_percentile, absolute
+            - nucleotide_change: edit_col, train_changes, test_changes, group_by
 
     Returns:
         RNASplitter instance
 
     Example:
+        >>> # Basic splits
         >>> splitter = get_rna_splitter('sequence_similarity', kmer_size=5)
         >>> train, val, test = splitter.split(df, seq_col='seq_a')
 
-        >>> splitter = get_rna_splitter('motif', motif_types=['kozak', 'uaug'])
+        >>> # Generalization splits
+        >>> splitter = get_rna_splitter('position', train_positions=[0,1,2], test_positions=[4,5,6])
+        >>> train, val, test = splitter.split(df)
+
+        >>> splitter = get_rna_splitter('experimental_context',
+        ...     train_contexts=['A_vs_A'], test_contexts=['M_vs_M'])
         >>> train, val, test = splitter.split(df)
     """
     splitters = {
@@ -827,7 +1393,13 @@ def get_rna_splitter(
         'motif': MotifSplitter,
         'edit_type': EditTypeSplitter,
         'gc_stratified': GCStratifiedSplitter,
-        'length_stratified': LengthStratifiedSplitter
+        'length_stratified': LengthStratifiedSplitter,
+        # New generalization splitters
+        'position': PositionSplitter,
+        'neighborhood_context': NeighborhoodContextSplitter,
+        'experimental_context': ExperimentalContextSplitter,
+        'effect_magnitude': EffectMagnitudeSplitter,
+        'nucleotide_change': NucleotideChangeSplitter,
     }
 
     if split_type not in splitters:
@@ -844,3 +1416,263 @@ def get_rna_splitter(
         random_state=random_state,
         **kwargs
     )
+
+
+class GeneralizationBenchmark:
+    """
+    Benchmark for systematically testing model generalization across multiple splits.
+
+    This class runs a model through all generalization splits and reports performance
+    on each, making it easy to identify where a model generalizes well vs. poorly.
+
+    Example:
+        >>> benchmark = GeneralizationBenchmark()
+        >>> results = benchmark.run(df, train_fn, eval_fn)
+        >>> benchmark.print_summary(results)
+    """
+
+    # Default split configurations for m6A edit prediction
+    DEFAULT_SPLITS = {
+        'random': {
+            'description': 'Random baseline (no distribution shift)',
+            'kwargs': {}
+        },
+        'position_5prime_to_3prime': {
+            'description': 'Train on 5\' positions, test on 3\' positions',
+            'split_type': 'position',
+            'kwargs': {'split_point': 0.5}
+        },
+        'position_explicit': {
+            'description': 'Train on pos 0-2, test on pos 4-6',
+            'split_type': 'position',
+            'kwargs': {'train_positions': [0, 1, 2], 'test_positions': [4, 5, 6]}
+        },
+        'context_gc': {
+            'description': 'Train on AU-rich context, test on GC-rich context',
+            'split_type': 'neighborhood_context',
+            'kwargs': {'split_by': 'gc_content', 'gc_threshold': 0.5}
+        },
+        'experimental_A_to_M': {
+            'description': 'Train on A_vs_A, test on M_vs_M (cross-context)',
+            'split_type': 'experimental_context',
+            'kwargs': {'train_contexts': ['A_vs_A'], 'test_contexts': ['M_vs_M']}
+        },
+        'experimental_M_to_A': {
+            'description': 'Train on M_vs_M, test on A_vs_A (cross-context)',
+            'split_type': 'experimental_context',
+            'kwargs': {'train_contexts': ['M_vs_M'], 'test_contexts': ['A_vs_A']}
+        },
+        'effect_small_to_large': {
+            'description': 'Train on small effects, test on large effects',
+            'split_type': 'effect_magnitude',
+            'kwargs': {'train_percentile': 75, 'test_percentile': 75}
+        },
+        'nucleotide_holdout': {
+            'description': 'Train on most changes, test on held-out change',
+            'split_type': 'nucleotide_change',
+            'kwargs': {'group_by': 'exact'}
+        },
+        'transition_to_transversion': {
+            'description': 'Train on transitions, test on transversions',
+            'split_type': 'nucleotide_change',
+            'kwargs': {
+                'group_by': 'transition_transversion',
+                'train_changes': ['transition'],
+                'test_changes': ['transversion']
+            }
+        },
+        'transversion_to_transition': {
+            'description': 'Train on transversions, test on transitions',
+            'split_type': 'nucleotide_change',
+            'kwargs': {
+                'group_by': 'transition_transversion',
+                'train_changes': ['transversion'],
+                'test_changes': ['transition']
+            }
+        },
+    }
+
+    def __init__(
+        self,
+        splits: Optional[Dict] = None,
+        random_state: int = 42
+    ):
+        """
+        Initialize benchmark.
+
+        Args:
+            splits: Dictionary of split configurations. If None, uses DEFAULT_SPLITS.
+            random_state: Random seed for reproducibility
+        """
+        self.splits = splits or self.DEFAULT_SPLITS
+        self.random_state = random_state
+
+    def get_split(self, split_name: str, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Get train/val/test split for a specific split configuration.
+
+        Args:
+            split_name: Name of the split configuration
+            df: DataFrame to split
+
+        Returns:
+            train_df, val_df, test_df
+        """
+        if split_name not in self.splits:
+            raise ValueError(f"Unknown split: {split_name}. Available: {list(self.splits.keys())}")
+
+        config = self.splits[split_name]
+        split_type = config.get('split_type', split_name)
+        kwargs = config.get('kwargs', {})
+
+        splitter = get_rna_splitter(
+            split_type,
+            random_state=self.random_state,
+            **kwargs
+        )
+
+        return splitter.split(df)
+
+    def run(
+        self,
+        df: pd.DataFrame,
+        train_fn,
+        eval_fn,
+        splits_to_run: Optional[List[str]] = None,
+        verbose: bool = True
+    ) -> Dict[str, Dict]:
+        """
+        Run benchmark across all splits.
+
+        Args:
+            df: Full dataset DataFrame
+            train_fn: Function(train_df, val_df) -> model
+            eval_fn: Function(model, test_df) -> dict of metrics
+            splits_to_run: List of split names to run (None = all)
+            verbose: Print progress
+
+        Returns:
+            Dictionary mapping split_name -> {
+                'description': str,
+                'train_size': int,
+                'val_size': int,
+                'test_size': int,
+                'metrics': dict
+            }
+        """
+        results = {}
+        splits_to_run = splits_to_run or list(self.splits.keys())
+
+        for split_name in splits_to_run:
+            if verbose:
+                print(f"\n{'='*70}")
+                print(f"Running split: {split_name}")
+                print(f"{'='*70}")
+
+            config = self.splits[split_name]
+
+            try:
+                train_df, val_df, test_df = self.get_split(split_name, df)
+
+                if len(train_df) == 0 or len(test_df) == 0:
+                    print(f"  Skipping: empty train or test set")
+                    continue
+
+                # Train model
+                model = train_fn(train_df, val_df)
+
+                # Evaluate
+                metrics = eval_fn(model, test_df)
+
+                results[split_name] = {
+                    'description': config.get('description', split_name),
+                    'train_size': len(train_df),
+                    'val_size': len(val_df),
+                    'test_size': len(test_df),
+                    'metrics': metrics
+                }
+
+                if verbose:
+                    print(f"  Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+                    for metric, value in metrics.items():
+                        print(f"  {metric}: {value:.4f}")
+
+            except Exception as e:
+                print(f"  Error: {e}")
+                results[split_name] = {
+                    'description': config.get('description', split_name),
+                    'error': str(e)
+                }
+
+        return results
+
+    def print_summary(
+        self,
+        results: Dict[str, Dict],
+        metric: str = 'r2',
+        sort_by_metric: bool = True
+    ):
+        """
+        Print summary table of benchmark results.
+
+        Args:
+            results: Results from run()
+            metric: Primary metric to display
+            sort_by_metric: Sort by metric value (descending)
+        """
+        print("\n" + "=" * 80)
+        print("GENERALIZATION BENCHMARK SUMMARY")
+        print("=" * 80)
+
+        rows = []
+        for split_name, result in results.items():
+            if 'error' in result:
+                rows.append({
+                    'split': split_name,
+                    'description': result['description'][:40],
+                    'train': '-',
+                    'test': '-',
+                    metric: 'ERROR'
+                })
+            else:
+                metric_val = result['metrics'].get(metric, np.nan)
+                rows.append({
+                    'split': split_name,
+                    'description': result['description'][:40],
+                    'train': result['train_size'],
+                    'test': result['test_size'],
+                    metric: metric_val
+                })
+
+        # Sort if requested
+        if sort_by_metric:
+            rows = sorted(rows, key=lambda x: x[metric] if isinstance(x[metric], (int, float)) else -999, reverse=True)
+
+        # Print table
+        print(f"\n{'Split':<30} {'Description':<42} {'Train':>8} {'Test':>8} {metric:>10}")
+        print("-" * 100)
+
+        for row in rows:
+            metric_str = f"{row[metric]:.4f}" if isinstance(row[metric], (int, float)) else row[metric]
+            print(f"{row['split']:<30} {row['description']:<42} {row['train']:>8} {row['test']:>8} {metric_str:>10}")
+
+        print("=" * 80)
+
+    def to_dataframe(self, results: Dict[str, Dict]) -> pd.DataFrame:
+        """Convert results to a DataFrame for further analysis."""
+        rows = []
+        for split_name, result in results.items():
+            row = {
+                'split': split_name,
+                'description': result.get('description', ''),
+                'train_size': result.get('train_size', 0),
+                'val_size': result.get('val_size', 0),
+                'test_size': result.get('test_size', 0),
+            }
+            if 'metrics' in result:
+                row.update(result['metrics'])
+            if 'error' in result:
+                row['error'] = result['error']
+            rows.append(row)
+
+        return pd.DataFrame(rows)

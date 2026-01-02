@@ -95,13 +95,14 @@ class RNAEmbedder(ABC):
         seq = seq.replace('T', 'U')
 
         # Validate
-        valid_chars = set('ACGU')
+        # Include M (m6A) and other modified nucleotides supported by RNA-FM
+        valid_chars = set('ACGUM')
         invalid_chars = set(seq) - valid_chars
 
         if invalid_chars:
             raise ValueError(
                 f"Invalid characters in RNA sequence: {invalid_chars}. "
-                f"Only A, C, G, U (or T) are allowed."
+                f"Only A, C, G, U, M (m6A) are allowed."
             )
 
         return seq

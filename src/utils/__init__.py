@@ -35,6 +35,22 @@ from .metrics import (
     ChemistryMetrics,
     print_metrics_summary
 )
+from .rna_splits import (
+    RNASplitter,
+    RandomRNASplitter,
+    SequenceSimilaritySplitter,
+    MotifSplitter,
+    EditTypeSplitter,
+    GCStratifiedSplitter,
+    LengthStratifiedSplitter,
+    PositionSplitter,
+    NeighborhoodContextSplitter,
+    ExperimentalContextSplitter,
+    EffectMagnitudeSplitter,
+    NucleotideChangeSplitter,
+    GeneralizationBenchmark,
+    get_rna_splitter
+)
 
 __all__ = [
     'setup_logger',
@@ -60,5 +76,20 @@ __all__ = [
     'MultiTaskMetrics',
     'RankingMetrics',
     'ChemistryMetrics',
-    'print_metrics_summary'
+    'print_metrics_summary',
+    # RNA splitters
+    'RNASplitter',
+    'RandomRNASplitter',
+    'SequenceSimilaritySplitter',
+    'MotifSplitter',
+    'EditTypeSplitter',
+    'GCStratifiedSplitter',
+    'LengthStratifiedSplitter',
+    'PositionSplitter',
+    'NeighborhoodContextSplitter',
+    'ExperimentalContextSplitter',
+    'EffectMagnitudeSplitter',
+    'NucleotideChangeSplitter',
+    'GeneralizationBenchmark',
+    'get_rna_splitter'
 ]

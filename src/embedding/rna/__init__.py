@@ -11,6 +11,7 @@ Sequence Embedders (molecule → vector):
 
 Edit Embedders (edit → vector):
 - RNAEditEmbedder: Simple difference (emb_B - emb_A), works with any embedder
+- PositionAwareEditEmbedder: One-hot features + RNA-FM per-token at edit position
 - StructuredRNAEditEmbedder: Rich edit embeddings with:
     * Mutation type (12 SNV types)
     * Mutation effect (Δ learned nucleotide embedding)
@@ -32,6 +33,12 @@ Structure predictors:
 from .base import RNAEmbedder
 from .nucleotide import NucleotideEmbedder
 from .edit_embedder import RNAEditEmbedder, TrainableRNAEditEmbedder
+from .position_aware_edit_embedder import (
+    PositionAwareEditEmbedder,
+    create_edit_features,
+    get_position_embeddings,
+    EDIT_TYPES
+)
 
 # Conditionally import pretrained embedders
 try:
@@ -95,7 +102,12 @@ __all__ = [
     # Edit embedders
     'RNAEditEmbedder',
     'TrainableRNAEditEmbedder',
+    'PositionAwareEditEmbedder',
     'StructuredRNAEditEmbedder',
+    # Position-aware helpers
+    'create_edit_features',
+    'get_position_embeddings',
+    'EDIT_TYPES',
     # Factory functions
     'create_rnafm_structured_embedder',
     'create_utrlm_structured_embedder',
